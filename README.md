@@ -1,4 +1,7 @@
-# AtomvmHttpd
+# AtomVMHttpd
+
+:httpd module(s) extracted from [atomvm_lib](https://github.com/atomvm/atomvm_lib).
+Exposed as a mix + rebar project, updated to work better with requests that span packets. 
 
 ## HTTPd Server
 
@@ -33,12 +36,12 @@ This section provides a detailed description of how to use the HTTPd server modu
 
 ## Using the HTTPd server
 
-To use the HTTPd server, add the `atomvm_lib` to your list of `rebar3` or `mix` dependencies.
+To use the HTTPd server, add the `atomvm_httpd` to your list of `rebar3` or `mix` dependencies.
 
 For example:
 
     %% rebar3
-    {deps, [atomvm_lib]}.
+    {deps, [atomvm_httpd]}.
     {plugins, [atomvm_rebar3_plugin]}.
 
 Use the `rebar3_atomvm_plugin` targets to build and flash your application, as per the [AtomVM Rebar3 documentation](https://github.com/atomvm/atomvm_rebar3_plugin).  E.g.,

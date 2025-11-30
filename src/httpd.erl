@@ -574,14 +574,23 @@ create_error(StatusCode, Error) ->
 create_reply(StatusCode, ContentType, Reply) when is_list(ContentType) orelse is_binary(ContentType) ->
     create_reply(StatusCode, #{"Content-Type" => ContentType}, Reply);
 create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
+    ReplyBin = iolist_to_binary(Reply),
+    HeadersWithLen = ensure_content_length(Headers, ReplyBin),
     [
         <<"HTTP/1.1 ">>, erlang:integer_to_binary(StatusCode), <<" ">>, moniker(StatusCode),
         <<"\r\n">>,
         io_lib:format("Server: atomvm-~s\r\n", [get_version_str(get_atomvm_version())]),
-        to_headers_list(Headers),
+        to_headers_list(HeadersWithLen),
         <<"\r\n">>,
-        Reply
+        ReplyBin
     ].
+
+%% @private
+ensure_content_length(Headers, ReplyBin) ->
+    LenBin = erlang:integer_to_binary(byte_size(ReplyBin)),
+    CleanHeaders0 = maps:remove("Content-Length", Headers),
+    CleanHeaders = maps:remove(<<"Content-Length">>, CleanHeaders0),
+    CleanHeaders#{<<"Content-Length">> => LenBin}.
 
 %% @private
 maybe_binary_to_string(Bin) when is_binary(Bin) ->

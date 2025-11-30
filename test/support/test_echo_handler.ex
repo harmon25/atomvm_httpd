@@ -12,6 +12,9 @@ defmodule AtomvmHttpd.TestEchoHandler do
       send(test_pid, {:http_request, request})
     end
 
-    {:close, %{"Content-Type" => "text/plain"}, "ok"}
+    headers = Map.get(state, :reply_headers, %{"Content-Type" => "text/plain"})
+    body = Map.get(state, :reply_body, "ok")
+
+    {:close, headers, body}
   end
 end

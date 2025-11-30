@@ -6,7 +6,8 @@ defmodule HttpdIntegrationTest do
   @receive_timeout 2_000
   @chunk_delay 5
   @large_body :binary.copy("a", 8_192)
-  @large_body_len Integer.to_string(byte_size(@large_body))
+  @large_iolist Enum.map(1..8_192, fn _ -> "b" end)
+  @large_iolist_len Integer.to_string(:erlang.iolist_size(@large_iolist))
 
   setup context do
     flush_mailbox()
@@ -79,10 +80,7 @@ defmodule HttpdIntegrationTest do
 
   @tag handler_config: %{
          reply_body: @large_body,
-         reply_headers: %{
-           "Content-Type" => "text/plain",
-           "Content-Length" => @large_body_len
-         }
+         reply_headers: %{"Content-Type" => "text/plain"}
        }
   test "sends large close responses without truncation", %{port: port} do
     {:ok, socket} = connect(port)
@@ -91,11 +89,33 @@ defmodule HttpdIntegrationTest do
       request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
       :ok = :gen_tcp.send(socket, request)
 
-      assert {:ok, response} = :gen_tcp.recv(socket, 0, @receive_timeout)
+      assert {:ok, response} = recv_all(socket)
       [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
 
       assert String.contains?(headers, "HTTP/1.1 200 OK")
       assert byte_size(body) == byte_size(@large_body)
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  @tag handler_config: %{
+         reply_body: @large_iolist,
+         reply_headers: %{"Content-Type" => "text/plain"}
+       }
+  test "sends large iolist close responses without truncation", %{port: port} do
+    {:ok, socket} = connect(port)
+
+    try do
+      request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+      :ok = :gen_tcp.send(socket, request)
+
+      assert {:ok, response} = recv_all(socket)
+      [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+
+      assert String.contains?(headers, "HTTP/1.1 200 OK")
+      assert String.contains?(headers, "Content-Length: " <> @large_iolist_len)
+      assert byte_size(body) == :erlang.iolist_size(@large_iolist)
     after
       :gen_tcp.close(socket)
     end

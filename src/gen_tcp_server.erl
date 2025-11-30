@@ -47,6 +47,7 @@
     addr => any
 }).
 -define(DEFAULT_SOCKET_OPTIONS, #{}).
+-define(MAX_SEND_CHUNK, 2048).
 
 %%
 %% API
@@ -168,16 +169,7 @@ try_send(Socket, Packet) when is_binary(Packet) ->
         "Trying to send binary packet data to socket ~p.  Packet (or len): ~p", [
         Socket, case byte_size(Packet) < 32 of true -> Packet; _ -> byte_size(Packet) end
     ]),
-    case socket:send(Socket, Packet) of
-        ok ->
-            ?TRACE("sent.", []),
-            ok;
-        {ok, Rest} ->
-            ?TRACE("sent.  remaining: ~p", [Rest]),
-            try_send(Socket, Rest);
-        Error ->
-            io:format("Send failed due to error ~p~n", [Error])
-    end;
+    try_send_binary(Socket, Packet);
 try_send(Socket, Char) when is_integer(Char) ->
     %% TODO handle unicode
     ?TRACE("Sending char ~p as ~p", [Char, <<Char:8>>]),
@@ -195,6 +187,20 @@ try_send_iolist(_Socket, []) ->
 try_send_iolist(Socket, [H | T]) ->
     try_send(Socket, H),
     try_send_iolist(Socket, T).
+
+try_send_binary(_Socket, <<>>) ->
+    ok;
+try_send_binary(Socket, Packet) when is_binary(Packet) ->
+    ChunkSize = erlang:min(byte_size(Packet), ?MAX_SEND_CHUNK),
+    <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
+    case socket:send(Socket, Chunk) of
+        ok ->
+            try_send_binary(Socket, Rest);
+        {ok, Remaining} ->
+            try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
+        Error ->
+            io:format("Send failed due to error ~p~n", [Error])
+    end.
 
 is_string([]) ->
     true;

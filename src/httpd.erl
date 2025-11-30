@@ -18,14 +18,13 @@
 -module(httpd).
 
 -export([start/2, start/3, start_link/2, start_link/3, stop/1]).
+-export([init/1, handle_receive/3, handle_tcp_closed/2]).
 
 -ifdef(TEST).
 -export([maybe_parse_http_request/1, handle_request_state/3, get_request_state/1]).
 -endif.
 
 -behaviour(gen_tcp_server).
--export([init/1, handle_receive/3, handle_tcp_closed/2]).
-
 -include("httpd.hrl").
 
 % -define(TRACE_ENABLED, true).
@@ -574,29 +573,48 @@ create_error(StatusCode, Error) ->
 create_reply(StatusCode, ContentType, Reply) when is_list(ContentType) orelse is_binary(ContentType) ->
     create_reply(StatusCode, #{"Content-Type" => ContentType}, Reply);
 create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
-    ReplyBin = iolist_to_binary(Reply),
-    HeadersWithLen = ensure_content_length(Headers, ReplyBin),
+    ReplyLen = iolist_length(Reply),
+    HeadersWithLen = ensure_content_length(Headers, ReplyLen),
     [
         <<"HTTP/1.1 ">>, erlang:integer_to_binary(StatusCode), <<" ">>, moniker(StatusCode),
         <<"\r\n">>,
         io_lib:format("Server: atomvm-~s\r\n", [get_version_str(get_atomvm_version())]),
         to_headers_list(HeadersWithLen),
         <<"\r\n">>,
-        ReplyBin
+        Reply
     ].
 
 %% @private
-ensure_content_length(Headers, ReplyBin) ->
-    LenBin = erlang:integer_to_binary(byte_size(ReplyBin)),
-    CleanHeaders0 = maps:remove("Content-Length", Headers),
-    CleanHeaders = maps:remove(<<"Content-Length">>, CleanHeaders0),
+ensure_content_length(Headers, ReplyLen) ->
+    LenBin = erlang:integer_to_binary(ReplyLen),
+    CleanHeaders = remove_content_length_header(Headers),
     CleanHeaders#{<<"Content-Length">> => LenBin}.
+
+%% @private
+remove_content_length_header(Headers) ->
+    KeysToRemove = [
+        "Content-Length",
+        <<"Content-Length">>,
+        "content-length",
+        <<"content-length">>
+    ],
+    lists:foldl(fun(Key, Acc) -> maps:remove(Key, Acc) end, Headers, KeysToRemove).
 
 %% @private
 maybe_binary_to_string(Bin) when is_binary(Bin) ->
     erlang:binary_to_list(Bin);
 maybe_binary_to_string(Other) ->
     Other.
+
+%% @private
+iolist_length(Bin) when is_binary(Bin) ->
+    erlang:byte_size(Bin);
+iolist_length(Int) when is_integer(Int), Int >= 0, Int =< 255 ->
+    1;
+iolist_length([]) ->
+    0;
+iolist_length([H | T]) ->
+    iolist_length(H) + iolist_length(T).
 
 %% @private
 to_headers_list(Headers) ->

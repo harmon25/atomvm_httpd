@@ -14,7 +14,7 @@ Exposed as a mix + rebar project, updated to work better with requests that span
 ### Elixir Mix
 
 ```elixir
-{:atomvm_httpd, git: "https://github.com/harmon25/atomvm_httpd", branch: "resp_fix_attempt"}
+{:atomvm_httpd, git: "https://github.com/harmon25/atomvm_httpd", branch: "main"}
 ```
 
 ## HTTPd Server

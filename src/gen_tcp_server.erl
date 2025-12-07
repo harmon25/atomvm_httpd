@@ -131,16 +131,29 @@ handle_info({tcp, Socket, Packet}, State) ->
     case Handler:handle_receive(Socket, Packet, HandlerState) of
         {reply, ResponsePacket, ResponseState} ->
             ?TRACE("Sending reply to endpoint ~p", [socket:peername(Socket)]),
-            try_send(Socket, ResponsePacket),
-            {noreply, State#state{handler_state=ResponseState}};
+            case try_send(Socket, ResponsePacket) of
+                ok ->
+                    {noreply, State#state{handler_state=ResponseState}};
+                {error, closed} ->
+                    ?TRACE("Connection closed during send, cleaning up", []),
+                    {noreply, State#state{handler_state=ResponseState}};
+                {error, _Reason} ->
+                    try_close(Socket),
+                    {noreply, State#state{handler_state=ResponseState}}
+            end;
         {noreply, ResponseState} ->
             ?TRACE("no reply", []),
             {noreply, State#state{handler_state=ResponseState}};
         {close, ResponsePacket} ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
-            try_send(Socket, ResponsePacket),
-            % timer:sleep(500),
-            try_close(Socket),
+            case try_send(Socket, ResponsePacket) of
+                ok ->
+                    try_close(Socket);
+                {error, closed} ->
+                    ok;  %% Already closed, nothing to do
+                {error, _Reason} ->
+                    try_close(Socket)
+            end,
             {noreply, State};
         close  ->
             ?TRACE("Closing socket ~p", [Socket]),
@@ -185,8 +198,12 @@ try_send(Socket, List) when is_list(List) ->
 try_send_iolist(_Socket, []) ->
     ok;
 try_send_iolist(Socket, [H | T]) ->
-    try_send(Socket, H),
-    try_send_iolist(Socket, T).
+    case try_send(Socket, H) of
+        ok ->
+            try_send_iolist(Socket, T);
+        {error, _Reason} = Error ->
+            Error
+    end.
 
 try_send_binary(_Socket, <<>>) ->
     ok;
@@ -197,9 +214,24 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
         ok ->
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
+            %% Partial send - combine remaining with rest and retry
             try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
-        Error ->
-            io:format("Send failed due to error ~p~n", [Error])
+        {error, eagain} ->
+            %% Socket buffer full, wait a bit and retry
+            timer:sleep(10),
+            try_send_binary(Socket, Packet);
+        {error, ewouldblock} ->
+            %% Same as eagain on some platforms
+            timer:sleep(10),
+            try_send_binary(Socket, Packet);
+        {error, closed} ->
+            io:format("Send failed: socket closed (sent ~p bytes of chunk, ~p bytes remaining)~n", 
+                      [ChunkSize, byte_size(Rest)]),
+            {error, closed};
+        {error, Reason} ->
+            io:format("Send failed due to error ~p (chunk size: ~p, remaining: ~p)~n", 
+                      [Reason, ChunkSize, byte_size(Rest)]),
+            {error, Reason}
     end.
 
 is_string([]) ->
@@ -222,7 +254,6 @@ try_close(Socket) ->
 set_socket_options(Socket, SocketOptions) ->
     maps:fold(
         fun(Option, Value, Accum) ->
-            erlang:display({setopt, Socket, Option, Value}),
             ok = socket:setopt(Socket, Option, Value),
             Accum
         end,

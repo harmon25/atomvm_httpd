@@ -213,25 +213,12 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
     case socket:send(Socket, Chunk) of
         ok ->
-            %% Small yield to let the network stack process
-            case Rest of
-                <<>> -> ok;
-                _ -> 
-                    timer:sleep(1),
-                    try_send_binary(Socket, Rest)
-            end;
+            %% Give the scheduler a chance to run and let TCP drain
+            maybe_yield(Rest),
+            try_send_binary(Socket, Rest);
         {ok, Remaining} ->
             %% Partial send - combine remaining with rest and retry
-            timer:sleep(5),
             try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
-        {error, eagain} ->
-            %% Socket buffer full, wait a bit and retry
-            timer:sleep(20),
-            try_send_binary(Socket, Packet);
-        {error, ewouldblock} ->
-            %% Same as eagain on some platforms
-            timer:sleep(20),
-            try_send_binary(Socket, Packet);
         {error, closed} ->
             io:format("Send failed: socket closed (sent ~p bytes of chunk, ~p bytes remaining)~n", 
                       [ChunkSize, byte_size(Rest)]),
@@ -241,6 +228,12 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
                       [Reason, ChunkSize, byte_size(Rest)]),
             {error, Reason}
     end.
+
+%% Lightweight yield using receive timeout - works in AtomVM
+maybe_yield(<<>>) ->
+    ok;
+maybe_yield(_) ->
+    receive after 0 -> ok end.
 
 is_string([]) ->
     true;

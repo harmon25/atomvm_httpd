@@ -47,7 +47,7 @@
     addr => any
 }).
 -define(DEFAULT_SOCKET_OPTIONS, #{}).
--define(MAX_SEND_CHUNK, 2048).
+-define(MAX_SEND_CHUNK, 4096).
 
 %%
 %% API

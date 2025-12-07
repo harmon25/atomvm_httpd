@@ -47,7 +47,8 @@
     addr => any
 }).
 -define(DEFAULT_SOCKET_OPTIONS, #{}).
--define(MAX_SEND_CHUNK, 4096).
+%% Smaller chunks work better with lwIP's limited buffers
+-define(MAX_SEND_CHUNK, 1460).  %% TCP MSS - fits in single packet without fragmentation
 
 %%
 %% API
@@ -212,17 +213,24 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
     case socket:send(Socket, Chunk) of
         ok ->
-            try_send_binary(Socket, Rest);
+            %% Small yield to let the network stack process
+            case Rest of
+                <<>> -> ok;
+                _ -> 
+                    timer:sleep(1),
+                    try_send_binary(Socket, Rest)
+            end;
         {ok, Remaining} ->
             %% Partial send - combine remaining with rest and retry
+            timer:sleep(5),
             try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
         {error, eagain} ->
             %% Socket buffer full, wait a bit and retry
-            timer:sleep(10),
+            timer:sleep(20),
             try_send_binary(Socket, Packet);
         {error, ewouldblock} ->
             %% Same as eagain on some platforms
-            timer:sleep(10),
+            timer:sleep(20),
             try_send_binary(Socket, Packet);
         {error, closed} ->
             io:format("Send failed: socket closed (sent ~p bytes of chunk, ~p bytes remaining)~n", 

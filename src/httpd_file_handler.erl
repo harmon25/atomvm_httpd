@@ -40,13 +40,19 @@ handle_http_req(#{method := get} = _HttpRequest, State) ->
     HandlerConfig = State#state.handler_config,
     App = maps:get(app, HandlerConfig),
     PathSuffix = State#state.path_suffix,
-    FullPath = join("/", lists:reverse(PathSuffix)),
-    ?TRACE("App: ~p PathSuffix: ~p FullPath: ~p", [App, PathSuffix, FullPath]),
+    %% Handle index file for directory requests (empty path or trailing slash)
+    ResolvedPath = case PathSuffix of
+        [] -> [<<"index.html">>];
+        _ -> PathSuffix
+    end,
+    FullPath = join("/", lists:reverse(ResolvedPath)),
+    ?TRACE("App: ~p PathSuffix: ~p FullPath: ~p", [App, ResolvedPath, FullPath]),
     case atomvm:read_priv(App, FullPath) of
         undefined ->
+            io:format("httpd_file_handler: file not found - app=~p path=~p~n", [App, FullPath]),
             {error, not_found};
         Data ->
-            {close, #{"Content-Type" => get_content_type(lists:reverse(PathSuffix))}, Data}
+            {close, #{"Content-Type" => get_content_type(lists:reverse(ResolvedPath))}, Data}
     end;
 handle_http_req(_HttpRequest, _HandlerConfig) ->
     {error, internal_server_error}.
@@ -68,12 +74,44 @@ get_content_type([Filename|_]) ->
     case get_suffix(Filename) of
         "html" ->
             "text/html";
+        "htm" ->
+            "text/html";
         "css" ->
             "text/css";
         "js" ->
             "text/javascript";
+        "json" ->
+            "application/json";
+        "xml" ->
+            "application/xml";
+        "txt" ->
+            "text/plain";
+        "png" ->
+            "image/png";
+        "jpg" ->
+            "image/jpeg";
+        "jpeg" ->
+            "image/jpeg";
+        "gif" ->
+            "image/gif";
+        "svg" ->
+            "image/svg+xml";
+        "ico" ->
+            "image/x-icon";
+        "woff" ->
+            "font/woff";
+        "woff2" ->
+            "font/woff2";
+        "ttf" ->
+            "font/ttf";
+        "eot" ->
+            "application/vnd.ms-fontobject";
+        "pdf" ->
+            "application/pdf";
+        "wasm" ->
+            "application/wasm";
         _ ->
-            "application/octet-streeam"
+            "application/octet-stream"
     end.
 
 get_suffix(Filename) ->

@@ -209,7 +209,8 @@ try_send_iolist(Socket, [H | T]) ->
 try_send_binary(_Socket, <<>>) ->
     ok;
 try_send_binary(Socket, Packet) when is_binary(Packet) ->
-    ChunkSize = erlang:min(byte_size(Packet), ?MAX_SEND_CHUNK),
+    TotalSize = byte_size(Packet),
+    ChunkSize = erlang:min(TotalSize, ?MAX_SEND_CHUNK),
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
     case socket:send(Socket, Chunk) of
         ok ->
@@ -220,12 +221,16 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
             %% Partial send - combine remaining with rest and retry
             try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
         {error, closed} ->
-            io:format("Send failed: socket closed (sent ~p bytes of chunk, ~p bytes remaining)~n", 
-                      [ChunkSize, byte_size(Rest)]),
+            %% Only log if we actually had more data to send
+            case byte_size(Rest) of
+                0 -> ok;  %% Sent everything, client just closed after - that's fine
+                _ -> io:format("Connection closed mid-transfer (~p/~p bytes sent)~n", 
+                               [ChunkSize, TotalSize])
+            end,
             {error, closed};
         {error, Reason} ->
-            io:format("Send failed due to error ~p (chunk size: ~p, remaining: ~p)~n", 
-                      [Reason, ChunkSize, byte_size(Rest)]),
+            io:format("Send error: ~p (chunk: ~p, total: ~p)~n", 
+                      [Reason, ChunkSize, TotalSize]),
             {error, Reason}
     end.
 

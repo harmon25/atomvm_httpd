@@ -275,8 +275,10 @@ accept(ControllingProcess, ListenSocket) ->
             ?TRACE("Accepted connection from ~p", [socket:peername(Connection)]),
             spawn(fun() -> accept(ControllingProcess, ListenSocket) end),
             loop(ControllingProcess, Connection);
-        _Error ->
-            ?TRACE("Error accepting connection: ~p", [Error])
+        Error ->
+            ?TRACE("Error accepting connection: ~p", [Error]),
+            timer:sleep(100),
+            accept(ControllingProcess, ListenSocket)
     end.
 
 

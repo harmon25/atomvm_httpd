@@ -307,7 +307,7 @@ call_http_req_handler(Socket, HttpRequest, State) ->
 update_state(Socket, HttpRequest, HandlerState, State) ->
     NewHttpRequest = HttpRequest#{handler_state := HandlerState},
     PendingRequestMap = State#state.pending_request_map,
-    NewPendingRequestMap = PendingRequestMap#{Socket := NewHttpRequest},
+    NewPendingRequestMap = PendingRequestMap#{Socket => NewHttpRequest},
     State#state{pending_request_map = NewPendingRequestMap}.
 
 

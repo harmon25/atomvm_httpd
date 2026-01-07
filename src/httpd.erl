@@ -183,12 +183,10 @@ handle_http_request(Socket, Packet, State) ->
                                             {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
                                     end;
                                 Error ->
-                                    Error
+                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
                             end
                     end;
                 {error, Reason} ->
-                    CleanBufferMap = maps:remove(Socket, BufferMap),
-                    _CleanState = State#state{pending_buffer_map = CleanBufferMap},
                     {close, create_error(?BAD_REQUEST, Reason)}
             end;
         PendingHttpRequest ->

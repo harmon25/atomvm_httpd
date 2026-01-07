@@ -46,7 +46,9 @@
     family => inet,
     addr => any
 }).
--define(DEFAULT_SOCKET_OPTIONS, #{}).
+-define(DEFAULT_SOCKET_OPTIONS, #{
+    {socket, reuseaddr} => true
+}).
 %% Smaller chunks work better with lwIP's limited buffers
 -define(MAX_SEND_CHUNK, 1460).  %% TCP MSS - fits in single packet without fragmentation
 

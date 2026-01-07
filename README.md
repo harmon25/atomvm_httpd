@@ -1,7 +1,12 @@
 # AtomVMHttpd
 
-:httpd module(s) extracted from [atomvm_lib](https://github.com/atomvm/atomvm_lib).
-Exposed as a mix + rebar project, updated to work better with requests that span packets, and large response bodies.
+HTTP/WebSocket server for [AtomVM](https://www.atomvm.net) - optimized for ESP32 and other resource-constrained embedded systems.
+
+Originally extracted from [atomvm_lib](https://github.com/atomvm/atomvm_lib), significantly enhanced with:
+- **Full HTTP/1.1 support** including chunked transfer, persistent connections, and `Expect: 100-continue`
+- **Production-ready WebSocket implementation** with TCP fragmentation handling for large payloads
+- **Memory-efficient design** - incremental processing, minimal allocations, optimized for lwIP TCP stack
+- **Comprehensive test coverage** - integration tests for HTTP and WebSocket functionality
 
 ## Getting Started
 
@@ -23,10 +28,22 @@ The HTTPd server provides a simple HTTP server for your AtomVM applications. Usi
 
 At a high level, this server supports the following features:
 
-- HTTP 1.1 support, per [RFC 2616](https://datatracker.ietf.org/doc/html/rfc2616);
-- Ability to efficiently serve files embedded in AtomVM AVM files;
-- An Erlang API for implementing your own REST-based APIs;
-- An Erlang API for implementing components and send and receive data over the [WebSocket](https://datatracker.ietf.org/doc/html/rfc6455) protocol.
+- **HTTP 1.1 support**, per [RFC 2616](https://datatracker.ietf.org/doc/html/rfc2616)
+  - Persistent connections (keep-alive)
+  - Chunked transfer encoding for large responses
+  - `Expect: 100-continue` for large uploads
+  - Multi-packet request/response handling
+- **Efficient file serving** from AtomVM AVM files with minimal memory overhead
+- **REST API framework** with automatic JSON encoding/decoding
+- **WebSocket protocol** ([RFC 6455](https://datatracker.ietf.org/doc/html/rfc6455)) with:
+  - Automatic frame fragmentation handling across TCP packets
+  - Support for payloads up to 64-bit length (gigabytes)
+  - Bidirectional messaging (client↔server)
+  - Server-initiated push messages
+- **ESP32-optimized networking**
+  - Configurable socket options (`SO_REUSEADDR`, buffer sizes, etc.)
+  - 1460-byte send chunking for lwIP compatibility
+  - Incremental I/O list processing to minimize heap pressure
 
 The HTTPd server is designed around a callback architecture, whereby users implement behaviors to handle various requests into the HTTP server. This architecture allows developers to focus on the logic of their applications, as opposed to the nitty gritty details of the HTTP protocol, while still providing access to contextual information about the request, including:
 
@@ -101,6 +118,28 @@ To start an instance of the HTTPd server, use the `httpd:start_link/2` function,
     ...
 
 If successful, the HTTPd server should be listening on the specified port for client connections.
+
+### Socket Options
+
+You can customize low-level socket behavior by providing socket options as the third parameter:
+
+    %% erlang - with custom socket options
+    Port = 8080,
+    SocketOptions = #{
+        {socket, reuseaddr} => true,    %% Allow immediate port reuse (default: true)
+        {otp, recvbuf} => 8192          %% Set receive buffer size
+    },
+    Config = ...
+    {ok, Httpd} = httpd:start_link(Port, SocketOptions, Config),
+    ...
+
+Supported socket options (per AtomVM's `socket` module):
+- `{socket, reuseaddr}` - `boolean()` - Allow address/port reuse (recommended for development)
+- `{socket, linger}` - `#{onoff => boolean(), linger => non_neg_integer()}` - Control connection close behavior
+- `{otp, recvbuf}` - `non_neg_integer()` - Receive buffer size in bytes
+- `{ip, add_membership}` - Multicast group membership (advanced)
+
+The default configuration enables `SO_REUSEADDR` which is particularly useful on ESP32 for quick restarts during development.
 
 > Note. The configuration for the HTTPd server is described in more detail below.
 
@@ -367,11 +406,18 @@ The HTTP WebSocket Handler API is designed to be as flexible as possible, allowi
 
 The API is also designed to hide the low-level websocket protocol, including the websocket handshake, as well as framing and un-framing of data (with and without masking), allowing application developers to focus on the business logic of their applications.
 
-This implementation conforms to version 13 of the [Web Socket](https://datatracker.ietf.org/doc/html/rfc6455) protocol, with the following exceptions:
+This implementation conforms to version 13 of the [Web Socket](https://datatracker.ietf.org/doc/html/rfc6455) protocol, with the following features:
 
-- No support for sub-protocol negotiation;
-- No support for message fragmentation;
-- No support for control frames (ping, pong, close, etc).
+- **Full frame fragmentation support** - handles WebSocket frames split across multiple TCP packets
+- **Large payload support** - messages up to 64-bit length (tested with 70KB+ payloads)
+- **Automatic masking/unmasking** - per WebSocket protocol requirements
+- **Bidirectional messaging** - client-to-server and server-to-client communication
+- **Frame buffering** - accumulates incomplete frames until complete message received
+
+Current limitations:
+- No support for sub-protocol negotiation
+- No support for WebSocket control frames (ping, pong, close)
+- No support for message compression
 
 #### The `httpd_ws_handler` Behavior
 

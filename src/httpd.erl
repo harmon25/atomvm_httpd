@@ -17,7 +17,7 @@
 
 -module(httpd).
 
--export([start/2, start/3, start_link/2, start_link/3, stop/1]).
+-export([start/2, start/3, start/4, start_link/2, start_link/3, start_link/4, stop/1]).
 -export([init/1, handle_receive/3, handle_tcp_closed/2]).
 
 -ifdef(TEST).
@@ -79,19 +79,27 @@
 
 -spec start(Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start(Port, Config) ->
-    start(any, Port, Config).
+    start(any, Port, #{}, Config).
 
 -spec start(Address :: address(), Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start(Address, Port, Config) ->
-    gen_tcp_server:start(#{addr => Address, port => Port}, ?MODULE, Config).
+    start(Address, Port, #{}, Config).
+
+-spec start(Address :: address(), Port :: portnum(), SocketOptions :: map(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
+start(Address, Port, SocketOptions, Config) ->
+    gen_tcp_server:start(#{addr => Address, port => Port}, SocketOptions, ?MODULE, Config).
 
 -spec start_link(Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Port, Config) ->
-    start_link(any, Port, Config).
+    start_link(any, Port, #{}, Config).
 
 -spec start_link(Address :: address(), Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Address, Port, Config) ->
-    gen_tcp_server:start_link(#{addr => Address, port => Port}, ?MODULE, Config).
+    start_link(Address, Port, #{}, Config).
+
+-spec start_link(Address :: address(), Port :: portnum(), SocketOptions :: map(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
+start_link(Address, Port, SocketOptions, Config) ->
+    gen_tcp_server:start_link(#{addr => Address, port => Port}, SocketOptions, ?MODULE, Config).
 
 stop(Httpd) ->
     gen_tcp_server:stop(Httpd).

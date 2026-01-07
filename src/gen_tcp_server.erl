@@ -184,10 +184,10 @@ try_send(Socket, Packet) when is_binary(Packet) ->
         Socket, case byte_size(Packet) < 32 of true -> Packet; _ -> byte_size(Packet) end
     ]),
     try_send_binary(Socket, Packet);
-try_send(Socket, Char) when is_integer(Char) ->
-    %% TODO handle unicode
-    ?TRACE("Sending char ~p as ~p", [Char, <<Char:8>>]),
-    try_send(Socket, <<Char:8>>);
+try_send(Socket, Byte) when is_integer(Byte) ->
+    %% Handles bytes (0-255) in iolists. Unicode must be pre-encoded to UTF-8.
+    ?TRACE("Sending byte ~p as ~p", [Byte, <<Byte:8>>]),
+    try_send(Socket, <<Byte:8>>);
 try_send(Socket, List) when is_list(List) ->
     case is_string(List) of
         true ->

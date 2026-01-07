@@ -161,7 +161,7 @@ handle_info({tcp, Socket, Packet}, State) ->
             try_close(Socket),
             {noreply, State};
         _SomethingElse ->
-            ?TRACE("Unexpected response from handler ~p: ~p", [Handler, SomethingElse]),
+            ?TRACE("Unexpected response from handler ~p: ~p", [Handler, _SomethingElse]),
             try_close(Socket),
             {noreply, State}
     end;
@@ -275,8 +275,8 @@ accept(ControllingProcess, ListenSocket) ->
             ?TRACE("Accepted connection from ~p", [socket:peername(Connection)]),
             spawn(fun() -> accept(ControllingProcess, ListenSocket) end),
             loop(ControllingProcess, Connection);
-        Error ->
-            ?TRACE("Error accepting connection: ~p", [Error]),
+        _Error ->
+            ?TRACE("Error accepting connection: ~p", [_Error]),
             timer:sleep(100),
             accept(ControllingProcess, ListenSocket)
     end.
@@ -294,6 +294,6 @@ loop(ControllingProcess, Connection) ->
             ControllingProcess ! {tcp_closed, Connection},
             ok;
         {error, _SomethingElse} ->
-            ?TRACE("Some other error occurred ~p", [Connection]),
+            ?TRACE("Some other error occurred ~p: ~p", [Connection, _SomethingElse]),
             try_close(Connection)
     end.

@@ -19,7 +19,7 @@ defmodule AtomvmHttpd do
   """
 
   @type port_number :: 0..65535
-  @type path :: [binary()]
+  @type path :: [binary()] | []
   @type handler_config :: %{handler: module(), handler_config: map()}
   @type config :: [{path(), handler_config()}]
 

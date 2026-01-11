@@ -137,7 +137,8 @@ handle_info({tcp, Socket, Packet}, State) ->
             case try_send(Socket, ResponsePacket) of
                 ok ->
                     {noreply, State#state{handler_state=ResponseState}};
-                {error, _} ->
+                {error, Reason} ->
+                    io:format("Send error: ~p~n", [Reason]),
                     {noreply, State#state{handler_state=ResponseState}}
             end;
         {noreply, ResponseState} ->
@@ -147,8 +148,10 @@ handle_info({tcp, Socket, Packet}, State) ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
             case try_send(Socket, ResponsePacket) of
                 ok ->
+                    io:format("Send complete~n"),
                     graceful_close(Socket);
-                {error, _} ->
+                {error, Reason} ->
+                    io:format("Send error on close: ~p~n", [Reason]),
                     try_close(Socket)
             end,
             {noreply, State};

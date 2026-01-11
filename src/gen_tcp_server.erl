@@ -306,7 +306,10 @@ loop(ControllingProcess, Connection) ->
             ?TRACE("Peer closed connection ~p", [Connection]),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
-        {error, _SomethingElse} ->
-            ?TRACE("Some other error occurred ~p: ~p", [Connection, _SomethingElse]),
-            try_close(Connection)
+        {error, Reason} ->
+            %% Don't close the socket here! The handler may still be sending.
+            %% Just notify the controlling process and let it handle cleanup.
+            io:format("Socket recv error on ~p: ~p~n", [Connection, Reason]),
+            ControllingProcess ! {tcp_closed, Connection},
+            ok
     end.

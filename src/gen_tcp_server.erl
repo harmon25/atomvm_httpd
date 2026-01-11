@@ -136,11 +136,13 @@ handle_info({tcp, Socket, Packet}, State) ->
             ?TRACE("Sending reply to endpoint ~p", [socket:peername(Socket)]),
             case try_send(Socket, ResponsePacket) of
                 ok ->
+                    io:format("Reply sent OK~n"),
                     {noreply, State#state{handler_state=ResponseState}};
                 {error, closed} ->
-                    ?TRACE("Connection closed during send, cleaning up", []),
+                    io:format("Reply failed: closed~n"),
                     {noreply, State#state{handler_state=ResponseState}};
-                {error, _Reason} ->
+                {error, Reason} ->
+                    io:format("Reply failed: ~p~n", [Reason]),
                     try_close(Socket),
                     {noreply, State#state{handler_state=ResponseState}}
             end;
@@ -151,11 +153,13 @@ handle_info({tcp, Socket, Packet}, State) ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
             case try_send(Socket, ResponsePacket) of
                 ok ->
-                    %% Give socket buffer time to drain before closing
+                    io:format("Close reply sent OK~n"),
                     graceful_close(Socket);
                 {error, closed} ->
-                    ok;  %% Already closed, nothing to do
-                {error, _Reason} ->
+                    io:format("Close reply failed: closed~n"),
+                    ok;
+                {error, Reason} ->
+                    io:format("Close reply failed: ~p~n", [Reason]),
                     try_close(Socket)
             end,
             {noreply, State};
@@ -223,33 +227,30 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
             maybe_yield(Rest),
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
-            %% Partial send - send Remaining first, then continue with Rest
-            %% Avoid <<Remaining/binary, Rest/binary>> which allocates a large new binary
+            %% Partial send - wait longer for buffer to drain, then retry
             io:format("Partial: ~p unsent~n", [byte_size(Remaining)]),
-            receive after 5 -> ok end,
+            receive after 50 -> ok end,
             case try_send_binary(Socket, Remaining) of
                 ok -> try_send_binary(Socket, Rest);
                 Error -> Error
             end;
         {error, eagain} ->
             %% Socket buffer full, wait and retry
-            receive after 10 -> ok end,
+            receive after 50 -> ok end,
             try_send_binary(Socket, Packet);
         {error, ewouldblock} ->
             %% Socket buffer full, wait and retry  
-            receive after 10 -> ok end,
+            receive after 50 -> ok end,
             try_send_binary(Socket, Packet);
         {error, timeout} ->
             %% Send timeout, retry
-            receive after 10 -> ok end,
+            receive after 50 -> ok end,
             try_send_binary(Socket, Packet);
         {error, closed} ->
-            %% Only log if we actually had more data to send
-            case byte_size(Rest) of
-                0 -> ok;  %% Sent everything, client just closed after
-                _ -> io:format("CLOSED (~p unsent)~n", [byte_size(Rest)])
-            end,
             {error, closed};
+        {error, ebadf} ->
+            %% Socket was closed/invalidated
+            {error, ebadf};
         {error, Reason} ->
             io:format("ERROR ~p (~p unsent)~n", [Reason, byte_size(Rest)]),
             {error, Reason}

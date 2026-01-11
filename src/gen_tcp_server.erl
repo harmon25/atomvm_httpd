@@ -134,26 +134,28 @@ handle_info({tcp, Socket, Packet}, State) ->
     case Handler:handle_receive(Socket, Packet, HandlerState) of
         {reply, ResponsePacket, ResponseState} ->
             ?TRACE("Sending reply to endpoint ~p", [socket:peername(Socket)]),
-            case try_send(Socket, ResponsePacket) of
-                ok ->
-                    {noreply, State#state{handler_state=ResponseState}};
-                {error, Reason} ->
-                    io:format("Send error: ~p~n", [Reason]),
-                    {noreply, State#state{handler_state=ResponseState}}
-            end;
+            %% Spawn send to avoid blocking other requests
+            spawn(fun() ->
+                case try_send(Socket, ResponsePacket) of
+                    ok -> ok;
+                    {error, _} -> ok
+                end
+            end),
+            {noreply, State#state{handler_state=ResponseState}};
         {noreply, ResponseState} ->
             ?TRACE("no reply", []),
             {noreply, State#state{handler_state=ResponseState}};
         {close, ResponsePacket} ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
-            case try_send(Socket, ResponsePacket) of
-                ok ->
-                    io:format("Send complete~n"),
-                    graceful_close(Socket);
-                {error, Reason} ->
-                    io:format("Send error on close: ~p~n", [Reason]),
-                    try_close(Socket)
-            end,
+            %% Spawn send to avoid blocking other requests
+            spawn(fun() ->
+                case try_send(Socket, ResponsePacket) of
+                    ok ->
+                        graceful_close(Socket);
+                    {error, _} ->
+                        try_close(Socket)
+                end
+            end),
             {noreply, State};
         close  ->
             ?TRACE("Closing socket ~p", [Socket]),
@@ -257,11 +259,10 @@ try_close(Socket) ->
     end.
 
 %% @private
-graceful_close(_Socket) ->
-    %% Don't close the socket ourselves - let the client close it
-    %% after receiving all data. The Connection: close header tells
-    %% the client to close, and we'll clean up when we get tcp_closed.
-    ok.
+graceful_close(Socket) ->
+    %% Brief delay to let TCP finish, then close
+    receive after 50 -> ok end,
+    try_close(Socket).
 
 %% @private
 set_socket_options(Socket, SocketOptions) ->

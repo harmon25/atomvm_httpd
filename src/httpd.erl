@@ -593,7 +593,6 @@ create_reply(StatusCode, ContentType, Reply) when is_list(ContentType) orelse is
     create_reply(StatusCode, #{"Content-Type" => ContentType}, Reply);
 create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
     ReplyLen = erlang:iolist_size(Reply),
-    io:format("Content-Length: ~p, actual body size: ~p~n", [ReplyLen, erlang:iolist_size(Reply)]),
     HeadersWithLen = ensure_content_length(Headers, ReplyLen),
     [
         <<"HTTP/1.1 ">>, erlang:integer_to_binary(StatusCode), <<" ">>, moniker(StatusCode),

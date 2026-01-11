@@ -217,13 +217,30 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
     case socket:send(Socket, Chunk) of
         ok ->
+            io:format("Sent chunk ~p/~p bytes~n", [ChunkSize, TotalSize]),
             %% Give the scheduler a chance to run and let TCP drain
             maybe_yield(Rest),
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
             %% Partial send - combine remaining with rest and retry
             io:format("Partial send: ~p bytes remaining, retrying~n", [byte_size(Remaining)]),
+            maybe_yield(Rest),
             try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
+        {error, eagain} ->
+            %% Socket buffer full, wait and retry
+            io:format("Socket buffer full (eagain), waiting...~n"),
+            receive after 10 -> ok end,
+            try_send_binary(Socket, Packet);
+        {error, ewouldblock} ->
+            %% Socket buffer full, wait and retry  
+            io:format("Socket buffer full (ewouldblock), waiting...~n"),
+            receive after 10 -> ok end,
+            try_send_binary(Socket, Packet);
+        {error, timeout} ->
+            %% Send timeout, retry
+            io:format("Send timeout, retrying...~n"),
+            receive after 10 -> ok end,
+            try_send_binary(Socket, Packet);
         {error, closed} ->
             %% Only log if we actually had more data to send
             case byte_size(Rest) of
@@ -303,13 +320,13 @@ loop(ControllingProcess, Connection) ->
             ControllingProcess ! {tcp, Connection, Data},
             loop(ControllingProcess, Connection);
         {error, closed} ->
-            ?TRACE("Peer closed connection ~p", [Connection]),
+            io:format("Loop: peer closed connection ~p~n", [Connection]),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
         {error, Reason} ->
             %% Don't close the socket here! The handler may still be sending.
             %% Just notify the controlling process and let it handle cleanup.
-            io:format("Socket recv error on ~p: ~p~n", [Connection, Reason]),
+            io:format("Loop: socket recv error on ~p: ~p~n", [Connection, Reason]),
             ControllingProcess ! {tcp_closed, Connection},
             ok
     end.

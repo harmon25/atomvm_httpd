@@ -217,43 +217,41 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
     TotalSize = byte_size(Packet),
     ChunkSize = erlang:min(TotalSize, ?MAX_SEND_CHUNK),
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
-    %% Get a short socket ID for logging (last 4 digits of ref)
-    SocketId = erlang:phash2(Socket, 10000),
     case socket:send(Socket, Chunk) of
         ok ->
-            io:format("[~p] Sent ~p/~p (~p left)~n", [SocketId, ChunkSize, TotalSize, byte_size(Rest)]),
+            io:format("Sent ~p/~p (~p left)~n", [ChunkSize, TotalSize, byte_size(Rest)]),
             %% Give the scheduler a chance to run and let TCP drain
             maybe_yield(Rest),
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
             %% Partial send - combine remaining with rest and retry
-            io:format("[~p] Partial: ~p unsent, retrying~n", [SocketId, byte_size(Remaining)]),
+            io:format("Partial: ~p unsent, retrying~n", [byte_size(Remaining)]),
             maybe_yield(Rest),
             try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
         {error, eagain} ->
             %% Socket buffer full, wait and retry
-            io:format("[~p] eagain, waiting~n", [SocketId]),
+            io:format("eagain, waiting~n", []),
             receive after 10 -> ok end,
             try_send_binary(Socket, Packet);
         {error, ewouldblock} ->
             %% Socket buffer full, wait and retry  
-            io:format("[~p] ewouldblock, waiting~n", [SocketId]),
+            io:format("ewouldblock, waiting~n", []),
             receive after 10 -> ok end,
             try_send_binary(Socket, Packet);
         {error, timeout} ->
             %% Send timeout, retry
-            io:format("[~p] timeout, retrying~n", [SocketId]),
+            io:format("timeout, retrying~n", []),
             receive after 10 -> ok end,
             try_send_binary(Socket, Packet);
         {error, closed} ->
             %% Only log if we actually had more data to send
             case byte_size(Rest) of
                 0 -> ok;  %% Sent everything, client just closed after
-                _ -> io:format("[~p] CLOSED mid-transfer (~p unsent)~n", [SocketId, byte_size(Rest)])
+                _ -> io:format("CLOSED mid-transfer (~p unsent)~n", [byte_size(Rest)])
             end,
             {error, closed};
         {error, Reason} ->
-            io:format("[~p] ERROR ~p (~p unsent)~n", [SocketId, Reason, byte_size(Rest)]),
+            io:format("ERROR ~p (~p unsent)~n", [Reason, byte_size(Rest)]),
             {error, Reason}
     end.
 
@@ -316,20 +314,19 @@ accept(ControllingProcess, ListenSocket) ->
 
 %% @private
 loop(ControllingProcess, Connection) ->
-    SocketId = erlang:phash2(Connection, 10000),
     case socket:recv(Connection) of
         {ok, Data} ->
             ?TRACE("Received data ~p on connection ~p", [Data, Connection]),
             ControllingProcess ! {tcp, Connection, Data},
             loop(ControllingProcess, Connection);
         {error, closed} ->
-            io:format("[~p] Loop: peer closed~n", [SocketId]),
+            io:format("Loop: peer closed~n", []),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
         {error, Reason} ->
             %% Don't close the socket here! The handler may still be sending.
             %% Just notify the controlling process and let it handle cleanup.
-            io:format("[~p] Loop: recv error ~p~n", [SocketId, Reason]),
+            io:format("Loop: recv error ~p~n", [Reason]),
             ControllingProcess ! {tcp_closed, Connection},
             ok
     end.

@@ -212,44 +212,30 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
     case socket:send(Socket, Chunk) of
         ok ->
-            %% Give the scheduler a chance to run and let TCP drain
-            maybe_yield(Rest),
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
-            %% Partial send - wait for buffer to drain, then retry
-            receive after 20 -> ok end,
+            %% Partial send - send remaining then continue with rest
             case try_send_binary(Socket, Remaining) of
                 ok -> try_send_binary(Socket, Rest);
                 Error -> Error
             end;
         {error, eagain} ->
-            %% Socket buffer full, wait and retry
-            receive after 50 -> ok end,
+            %% Socket buffer full, brief pause and retry
+            receive after 5 -> ok end,
             try_send_binary(Socket, Packet);
         {error, ewouldblock} ->
-            %% Socket buffer full, wait and retry  
-            receive after 50 -> ok end,
+            receive after 5 -> ok end,
             try_send_binary(Socket, Packet);
         {error, timeout} ->
-            %% Send timeout, retry
-            receive after 50 -> ok end,
+            receive after 5 -> ok end,
             try_send_binary(Socket, Packet);
         {error, closed} ->
             {error, closed};
         {error, ebadf} ->
-            %% Socket was closed/invalidated
             {error, ebadf};
         {error, Reason} ->
-            io:format("ERROR ~p (~p unsent)~n", [Reason, byte_size(Rest)]),
             {error, Reason}
     end.
-
-%% Lightweight yield using receive timeout - works in AtomVM
-maybe_yield(<<>>) ->
-    ok;
-maybe_yield(_) ->
-    %% Brief yield to let TCP drain - keep it short to avoid client timeouts
-    receive after 1 -> ok end.
 
 is_string([]) ->
     true;
@@ -269,10 +255,8 @@ try_close(Socket) ->
 
 %% @private
 graceful_close(Socket) ->
-    %% ESP32 lwIP needs time to drain the send buffer before close
-    %% Without this delay, close() may RST the connection before all data is sent
-    %% TODO: find a better way to determine when send buffer is empty
-    receive after 100 -> ok end,
+    %% Brief pause to let lwIP finish transmitting before close
+    receive after 10 -> ok end,
     try_close(Socket).
 
 %% @private

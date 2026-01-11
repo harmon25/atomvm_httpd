@@ -47,12 +47,18 @@ handle_http_req(#{method := get} = _HttpRequest, State) ->
     end,
     FullPath = join("/", lists:reverse(ResolvedPath)),
     ?TRACE("App: ~p PathSuffix: ~p FullPath: ~p", [App, ResolvedPath, FullPath]),
-    case atomvm:read_priv(App, FullPath) of
-        undefined ->
-            io:format("httpd_file_handler: file not found - app=~p path=~p~n", [App, FullPath]),
-            {error, not_found};
-        Data ->
-            {close, #{"Content-Type" => get_content_type(lists:reverse(ResolvedPath))}, Data}
+    try
+        case atomvm:read_priv(App, FullPath) of
+            undefined ->
+                io:format("httpd_file_handler: file not found - app=~p path=~p~n", [App, FullPath]),
+                {error, not_found};
+            Data when is_binary(Data) ->
+                {close, #{"Content-Type" => get_content_type(lists:reverse(ResolvedPath))}, Data}
+        end
+    catch
+        _:Reason ->
+            io:format("httpd_file_handler: error reading file ~p: ~p~n", [FullPath, Reason]),
+            {error, internal_server_error}
     end;
 handle_http_req(_HttpRequest, _HandlerConfig) ->
     {error, internal_server_error}.

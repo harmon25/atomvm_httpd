@@ -222,6 +222,7 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
             %% Partial send - combine remaining with rest and retry
+            io:format("Partial send: ~p bytes remaining, retrying~n", [byte_size(Remaining)]),
             try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
         {error, closed} ->
             %% Only log if we actually had more data to send
@@ -232,8 +233,8 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
             end,
             {error, closed};
         {error, Reason} ->
-            io:format("Send error: ~p (chunk: ~p, total: ~p)~n", 
-                      [Reason, ChunkSize, TotalSize]),
+            io:format("Send error: ~p (chunk: ~p, total: ~p, remaining: ~p)~n", 
+                      [Reason, ChunkSize, TotalSize, byte_size(Rest)]),
             {error, Reason}
     end.
 
@@ -241,8 +242,9 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
 maybe_yield(<<>>) ->
     ok;
 maybe_yield(_) ->
-    %% Small delay helps ESP32 lwIP drain socket buffers
-    receive after 1 -> ok end.
+    %% Give ESP32 lwIP time to drain socket buffers between chunks
+    %% This prevents buffer overflow and connection resets
+    receive after 5 -> ok end.
 
 is_string([]) ->
     true;
@@ -262,17 +264,10 @@ try_close(Socket) ->
 
 %% @private
 graceful_close(Socket) ->
-    %% Shutdown write side to signal no more data, but keep reading until closed
-    %% This ensures all buffered data is transmitted before closing
-    case socket:shutdown(Socket, write) of
-        ok ->
-            %% Give ESP32 lwIP time to flush buffers (typically ~10-50ms for full MTU)
-            timer:sleep(10),
-            try_close(Socket);
-        {error, _Reason} ->
-            %% If shutdown fails, just close immediately
-            try_close(Socket)
-    end.
+    %% Don't shutdown write immediately - let all data be queued first
+    %% ESP32 lwIP needs time to drain the send buffer between chunks
+    %% Simply close - the FIN will be sent after all buffered data
+    try_close(Socket).
 
 %% @private
 set_socket_options(Socket, SocketOptions) ->

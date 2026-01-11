@@ -121,6 +121,180 @@ defmodule HttpdIntegrationTest do
     end
   end
 
+  @tag handler_config: %{
+         reply_body: ["Hello", " ", "World"],
+         reply_headers: %{"Content-Type" => "text/plain"}
+       }
+  test "handles simple nested iolist with correct content-length", %{port: port} do
+    iolist = ["Hello", " ", "World"]
+    expected_body = "Hello World"
+    {:ok, socket} = connect(port)
+
+    try do
+      request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+      :ok = :gen_tcp.send(socket, request)
+
+      assert {:ok, response} = recv_all(socket)
+      [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+
+      assert String.contains?(headers, "HTTP/1.1 200 OK")
+
+      expected_length = :erlang.iolist_size(iolist)
+      assert String.contains?(headers, "Content-Length: #{expected_length}"),
+             "Expected Content-Length: #{expected_length}"
+
+      assert body == expected_body
+      assert byte_size(body) == expected_length
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  @tag handler_config: %{
+         reply_body: [["Deep"], [["ly"], " nested"]],
+         reply_headers: %{"Content-Type" => "text/plain"}
+       }
+  test "handles deeply nested iolist with correct content-length", %{port: port} do
+    iolist = [["Deep"], [["ly"], " nested"]]
+    expected_body = "Deeply nested"
+    {:ok, socket} = connect(port)
+
+    try do
+      request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+      :ok = :gen_tcp.send(socket, request)
+
+      assert {:ok, response} = recv_all(socket)
+      [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+
+      assert String.contains?(headers, "HTTP/1.1 200 OK")
+
+      expected_length = :erlang.iolist_size(iolist)
+      assert String.contains?(headers, "Content-Length: #{expected_length}"),
+             "Expected Content-Length: #{expected_length}"
+
+      assert body == expected_body
+      assert byte_size(body) == expected_length
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  @tag handler_config: %{
+         reply_body: [<<"Binary">>, " and ", "string"],
+         reply_headers: %{"Content-Type" => "text/plain"}
+       }
+  test "handles mixed binary and string iolist with correct content-length", %{port: port} do
+    iolist = [<<"Binary">>, " and ", "string"]
+    expected_body = "Binary and string"
+    {:ok, socket} = connect(port)
+
+    try do
+      request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+      :ok = :gen_tcp.send(socket, request)
+
+      assert {:ok, response} = recv_all(socket)
+      [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+
+      assert String.contains?(headers, "HTTP/1.1 200 OK")
+
+      expected_length = :erlang.iolist_size(iolist)
+      assert String.contains?(headers, "Content-Length: #{expected_length}"),
+             "Expected Content-Length: #{expected_length}"
+
+      assert body == expected_body
+      assert byte_size(body) == expected_length
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  @tag handler_config: %{
+         reply_body: [<<"Start">>, 32, <<"End">>],
+         reply_headers: %{"Content-Type" => "text/plain"}
+       }
+  test "handles iolist with byte integers with correct content-length", %{port: port} do
+    iolist = [<<"Start">>, 32, <<"End">>]
+    expected_body = "Start End"
+    {:ok, socket} = connect(port)
+
+    try do
+      request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+      :ok = :gen_tcp.send(socket, request)
+
+      assert {:ok, response} = recv_all(socket)
+      [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+
+      assert String.contains?(headers, "HTTP/1.1 200 OK")
+
+      expected_length = :erlang.iolist_size(iolist)
+      assert String.contains?(headers, "Content-Length: #{expected_length}"),
+             "Expected Content-Length: #{expected_length}"
+
+      assert body == expected_body
+      assert byte_size(body) == expected_length
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  @tag handler_config: %{
+         reply_body: [<<"A">>, [<<"B">>, [<<"C">>]], <<"D">>],
+         reply_headers: %{"Content-Type" => "text/plain"}
+       }
+  test "handles complex nested iolist structure with correct content-length", %{port: port} do
+    iolist = [<<"A">>, [<<"B">>, [<<"C">>]], <<"D">>]
+    expected_body = "ABCD"
+    {:ok, socket} = connect(port)
+
+    try do
+      request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+      :ok = :gen_tcp.send(socket, request)
+
+      assert {:ok, response} = recv_all(socket)
+      [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+
+      assert String.contains?(headers, "HTTP/1.1 200 OK")
+
+      expected_length = :erlang.iolist_size(iolist)
+      assert String.contains?(headers, "Content-Length: #{expected_length}"),
+             "Expected Content-Length: #{expected_length}"
+
+      assert body == expected_body
+      assert byte_size(body) == expected_length
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  @tag handler_config: %{
+         reply_body: [<<"X">>, [], <<"Y">>, [[], <<"Z">>]],
+         reply_headers: %{"Content-Type" => "text/plain"}
+       }
+  test "handles iolist with empty lists with correct content-length", %{port: port} do
+    iolist = [<<"X">>, [], <<"Y">>, [[], <<"Z">>]]
+    expected_body = "XYZ"
+    {:ok, socket} = connect(port)
+
+    try do
+      request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+      :ok = :gen_tcp.send(socket, request)
+
+      assert {:ok, response} = recv_all(socket)
+      [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+
+      assert String.contains?(headers, "HTTP/1.1 200 OK")
+
+      expected_length = :erlang.iolist_size(iolist)
+      assert String.contains?(headers, "Content-Length: #{expected_length}"),
+             "Expected Content-Length: #{expected_length}"
+
+      assert body == expected_body
+      assert byte_size(body) == expected_length
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
   defp connect(port) do
     :gen_tcp.connect(~c"localhost", port, [:binary, active: false, packet: :raw])
   end

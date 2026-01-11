@@ -579,7 +579,7 @@ create_error(StatusCode, Error) ->
 create_reply(StatusCode, ContentType, Reply) when is_list(ContentType) orelse is_binary(ContentType) ->
     create_reply(StatusCode, #{"Content-Type" => ContentType}, Reply);
 create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
-    ReplyLen = iolist_length(Reply),
+    ReplyLen = erlang:iolist_size(Reply),
     HeadersWithLen = ensure_content_length(Headers, ReplyLen),
     [
         <<"HTTP/1.1 ">>, erlang:integer_to_binary(StatusCode), <<" ">>, moniker(StatusCode),
@@ -611,16 +611,6 @@ maybe_binary_to_string(Bin) when is_binary(Bin) ->
     erlang:binary_to_list(Bin);
 maybe_binary_to_string(Other) ->
     Other.
-
-%% @private
-iolist_length(Bin) when is_binary(Bin) ->
-    erlang:byte_size(Bin);
-iolist_length(Int) when is_integer(Int), Int >= 0, Int =< 255 ->
-    1;
-iolist_length([]) ->
-    0;
-iolist_length([H | T]) ->
-    iolist_length(H) + iolist_length(T).
 
 %% @private
 to_headers_list(Headers) ->

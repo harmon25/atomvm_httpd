@@ -210,6 +210,7 @@ try_send_iolist(Socket, [H | T]) ->
     end.
 
 try_send_binary(_Socket, <<>>) ->
+    io:format("Send complete~n"),
     ok;
 try_send_binary(Socket, Packet) when is_binary(Packet) ->
     TotalSize = byte_size(Packet),
@@ -220,23 +221,29 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
             %% Partial send - send remaining then continue with rest
+            io:format("Partial: ~p bytes~n", [byte_size(Remaining)]),
             case try_send_binary(Socket, Remaining) of
                 ok -> try_send_binary(Socket, Rest);
                 Error -> Error
             end;
         {error, eagain} ->
             %% Socket buffer full, brief pause and retry
+            io:format("eagain~n"),
             receive after 5 -> ok end,
             try_send_binary(Socket, Packet);
         {error, ewouldblock} ->
+            io:format("ewouldblock~n"),
             receive after 5 -> ok end,
             try_send_binary(Socket, Packet);
         {error, timeout} ->
+            io:format("timeout~n"),
             receive after 5 -> ok end,
             try_send_binary(Socket, Packet);
         {error, closed} ->
+            io:format("closed~n"),
             {error, closed};
         {error, ebadf} ->
+            io:format("ebadf~n"),
             {error, ebadf};
         {error, Reason} ->
             {error, Reason}

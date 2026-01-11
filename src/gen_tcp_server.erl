@@ -190,14 +190,11 @@ try_send(Socket, Packet) when is_binary(Packet) ->
 try_send(Socket, Byte) when is_integer(Byte) ->
     %% Handles bytes (0-255) in iolists. Unicode must be pre-encoded to UTF-8.
     ?TRACE("Sending byte ~p as ~p", [Byte, <<Byte:8>>]),
-    try_send(Socket, <<Byte:8>>);
+    try_send_binary(Socket, <<Byte:8>>);
 try_send(Socket, List) when is_list(List) ->
-    case is_string(List) of
-        true ->
-            try_send(Socket, list_to_binary(List));
-        _ ->
-            try_send_iolist(Socket, List)
-    end.
+    %% Flatten iolist to binary to reduce number of send syscalls
+    %% This is more efficient than sending each element separately
+    try_send_binary(Socket, erlang:iolist_to_binary(List)).
 
 try_send_iolist(_Socket, []) ->
     ok;
@@ -259,9 +256,8 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
 maybe_yield(<<>>) ->
     ok;
 maybe_yield(_) ->
-    %% Give ESP32 lwIP time to drain socket buffers between chunks
-    %% This prevents buffer overflow and connection resets
-    receive after 5 -> ok end.
+    %% Brief yield to let TCP drain - keep it short to avoid client timeouts
+    receive after 1 -> ok end.
 
 is_string([]) ->
     true;

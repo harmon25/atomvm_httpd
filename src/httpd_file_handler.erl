@@ -67,9 +67,11 @@ serve_file(App, FullPath, ResolvedPath, true = _AcceptsGzip) ->
     case atomvm:read_priv(App, GzPath) of
         undefined ->
             %% No gzipped version, serve original
+            io:format("No gzip for ~s, serving original~n", [FullPath]),
             serve_file(App, FullPath, ResolvedPath, false);
         Data when is_binary(Data) ->
             %% Serve gzipped version with Content-Encoding header
+            io:format("Serving ~s.gz (~p bytes, gzipped)~n", [FullPath, byte_size(Data)]),
             ContentType = get_content_type(lists:reverse(ResolvedPath)),
             {close, #{"Content-Type" => ContentType, "Content-Encoding" => "gzip"}, Data}
     end;
@@ -79,6 +81,7 @@ serve_file(App, FullPath, ResolvedPath, false = _AcceptsGzip) ->
             io:format("httpd_file_handler: file not found - app=~p path=~p~n", [App, FullPath]),
             {error, not_found};
         Data when is_binary(Data) ->
+            io:format("Serving ~s (~p bytes, uncompressed)~n", [FullPath, byte_size(Data)]),
             {close, #{"Content-Type" => get_content_type(lists:reverse(ResolvedPath))}, Data}
     end.
 

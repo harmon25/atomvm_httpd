@@ -151,7 +151,8 @@ handle_info({tcp, Socket, Packet}, State) ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
             case try_send(Socket, ResponsePacket) of
                 ok ->
-                    try_close(Socket);
+                    %% Give socket buffer time to drain before closing
+                    graceful_close(Socket);
                 {error, closed} ->
                     ok;  %% Already closed, nothing to do
                 {error, _Reason} ->
@@ -240,7 +241,8 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
 maybe_yield(<<>>) ->
     ok;
 maybe_yield(_) ->
-    receive after 0 -> ok end.
+    %% Small delay helps ESP32 lwIP drain socket buffers
+    receive after 1 -> ok end.
 
 is_string([]) ->
     true;
@@ -256,6 +258,20 @@ try_close(Socket) ->
             ok;
         Error ->
             io:format("Close failed due to error ~p~n", [Error])
+    end.
+
+%% @private
+graceful_close(Socket) ->
+    %% Shutdown write side to signal no more data, but keep reading until closed
+    %% This ensures all buffered data is transmitted before closing
+    case socket:shutdown(Socket, write) of
+        ok ->
+            %% Give ESP32 lwIP time to flush buffers (typically ~10-50ms for full MTU)
+            timer:sleep(10),
+            try_close(Socket);
+        {error, _Reason} ->
+            %% If shutdown fails, just close immediately
+            try_close(Socket)
     end.
 
 %% @private

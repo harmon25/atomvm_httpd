@@ -219,35 +219,35 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
     case socket:send(Socket, Chunk) of
         ok ->
-            io:format("Sent ~p/~p (~p left)~n", [ChunkSize, TotalSize, byte_size(Rest)]),
             %% Give the scheduler a chance to run and let TCP drain
             maybe_yield(Rest),
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
-            %% Partial send - combine remaining with rest and retry
-            io:format("Partial: ~p unsent, retrying~n", [byte_size(Remaining)]),
-            maybe_yield(Rest),
-            try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
+            %% Partial send - send Remaining first, then continue with Rest
+            %% Avoid <<Remaining/binary, Rest/binary>> which allocates a large new binary
+            io:format("Partial: ~p unsent~n", [byte_size(Remaining)]),
+            receive after 5 -> ok end,
+            case try_send_binary(Socket, Remaining) of
+                ok -> try_send_binary(Socket, Rest);
+                Error -> Error
+            end;
         {error, eagain} ->
             %% Socket buffer full, wait and retry
-            io:format("eagain, waiting~n", []),
             receive after 10 -> ok end,
             try_send_binary(Socket, Packet);
         {error, ewouldblock} ->
             %% Socket buffer full, wait and retry  
-            io:format("ewouldblock, waiting~n", []),
             receive after 10 -> ok end,
             try_send_binary(Socket, Packet);
         {error, timeout} ->
             %% Send timeout, retry
-            io:format("timeout, retrying~n", []),
             receive after 10 -> ok end,
             try_send_binary(Socket, Packet);
         {error, closed} ->
             %% Only log if we actually had more data to send
             case byte_size(Rest) of
                 0 -> ok;  %% Sent everything, client just closed after
-                _ -> io:format("CLOSED mid-transfer (~p unsent)~n", [byte_size(Rest)])
+                _ -> io:format("CLOSED (~p unsent)~n", [byte_size(Rest)])
             end,
             {error, closed};
         {error, Reason} ->

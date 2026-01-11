@@ -254,16 +254,11 @@ try_close(Socket) ->
     end.
 
 %% @private
-graceful_close(Socket) ->
-    %% Shutdown write side to send FIN, allowing buffered data to drain
-    %% This is non-blocking and lets TCP stack finish transmitting
-    case socket:shutdown(Socket, write) of
-        ok -> ok;
-        {error, _} -> ok  %% Ignore errors (socket may already be closed)
-    end,
-    %% Brief delay then close - FIN has been queued
-    receive after 50 -> ok end,
-    try_close(Socket).
+graceful_close(_Socket) ->
+    %% Don't close the socket ourselves - let the client close it
+    %% after receiving all data. The Connection: close header tells
+    %% the client to close, and we'll clean up when we get tcp_closed.
+    ok.
 
 %% @private
 set_socket_options(Socket, SocketOptions) ->

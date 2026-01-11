@@ -53,7 +53,6 @@ handle_http_req(#{method := get} = _HttpRequest, State) ->
                 io:format("httpd_file_handler: file not found - app=~p path=~p~n", [App, FullPath]),
                 {error, not_found};
             Data when is_binary(Data) ->
-                io:format("Serving ~s (~p bytes)~n", [FullPath, byte_size(Data)]),
                 {close, #{"Content-Type" => get_content_type(lists:reverse(ResolvedPath))}, Data}
         end
     catch

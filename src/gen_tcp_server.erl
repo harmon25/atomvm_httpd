@@ -136,14 +136,8 @@ handle_info({tcp, Socket, Packet}, State) ->
             ?TRACE("Sending reply to endpoint ~p", [socket:peername(Socket)]),
             case try_send(Socket, ResponsePacket) of
                 ok ->
-                    io:format("Reply sent OK~n"),
                     {noreply, State#state{handler_state=ResponseState}};
-                {error, closed} ->
-                    io:format("Reply failed: closed~n"),
-                    {noreply, State#state{handler_state=ResponseState}};
-                {error, Reason} ->
-                    io:format("Reply failed: ~p~n", [Reason]),
-                    try_close(Socket),
+                {error, _} ->
                     {noreply, State#state{handler_state=ResponseState}}
             end;
         {noreply, ResponseState} ->
@@ -153,13 +147,8 @@ handle_info({tcp, Socket, Packet}, State) ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
             case try_send(Socket, ResponsePacket) of
                 ok ->
-                    io:format("Close reply sent OK~n"),
                     graceful_close(Socket);
-                {error, closed} ->
-                    io:format("Close reply failed: closed~n"),
-                    ok;
-                {error, Reason} ->
-                    io:format("Close reply failed: ~p~n", [Reason]),
+                {error, _} ->
                     try_close(Socket)
             end,
             {noreply, State};
@@ -227,9 +216,8 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
             maybe_yield(Rest),
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
-            %% Partial send - wait longer for buffer to drain, then retry
-            io:format("Partial: ~p unsent~n", [byte_size(Remaining)]),
-            receive after 50 -> ok end,
+            %% Partial send - wait for buffer to drain, then retry
+            receive after 20 -> ok end,
             case try_send_binary(Socket, Remaining) of
                 ok -> try_send_binary(Socket, Rest);
                 Error -> Error
@@ -321,13 +309,11 @@ loop(ControllingProcess, Connection) ->
             ControllingProcess ! {tcp, Connection, Data},
             loop(ControllingProcess, Connection);
         {error, closed} ->
-            io:format("Loop: peer closed~n", []),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
-        {error, Reason} ->
+        {error, _Reason} ->
             %% Don't close the socket here! The handler may still be sending.
             %% Just notify the controlling process and let it handle cleanup.
-            io:format("Loop: recv error ~p~n", [Reason]),
             ControllingProcess ! {tcp_closed, Connection},
             ok
     end.

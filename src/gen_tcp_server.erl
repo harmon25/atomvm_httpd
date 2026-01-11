@@ -255,8 +255,9 @@ try_close(Socket) ->
 
 %% @private
 graceful_close(Socket) ->
-    %% Brief pause to let lwIP finish transmitting before close
-    receive after 10 -> ok end,
+    %% Wait for lwIP to finish transmitting before close
+    %% 30KB @ ~1Mbps = ~240ms, add buffer for TCP ACKs
+    receive after 500 -> ok end,
     try_close(Socket).
 
 %% @private

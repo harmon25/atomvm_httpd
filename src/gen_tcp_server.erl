@@ -192,9 +192,14 @@ try_send(Socket, Byte) when is_integer(Byte) ->
     ?TRACE("Sending byte ~p as ~p", [Byte, <<Byte:8>>]),
     try_send_binary(Socket, <<Byte:8>>);
 try_send(Socket, List) when is_list(List) ->
-    %% Flatten iolist to binary to reduce number of send syscalls
-    %% This is more efficient than sending each element separately
-    try_send_binary(Socket, erlang:iolist_to_binary(List)).
+    case is_string(List) of
+        true ->
+            %% It's a string (list of integers), convert to binary
+            try_send_binary(Socket, list_to_binary(List));
+        false ->
+            %% It's an iolist, send each element
+            try_send_iolist(Socket, List)
+    end.
 
 try_send_iolist(_Socket, []) ->
     ok;
@@ -277,9 +282,10 @@ try_close(Socket) ->
 
 %% @private
 graceful_close(Socket) ->
-    %% Don't shutdown write immediately - let all data be queued first
-    %% ESP32 lwIP needs time to drain the send buffer between chunks
-    %% Simply close - the FIN will be sent after all buffered data
+    %% ESP32 lwIP needs time to drain the send buffer before close
+    %% Without this delay, close() may RST the connection before all data is sent
+    %% TODO: find a better way to determine when send buffer is empty
+    receive after 100 -> ok end,
     try_close(Socket).
 
 %% @private

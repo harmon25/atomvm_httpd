@@ -255,9 +255,14 @@ try_close(Socket) ->
 
 %% @private
 graceful_close(Socket) ->
-    %% Wait for lwIP to finish transmitting before close
-    %% 30KB @ ~1Mbps = ~240ms, add buffer for TCP ACKs
-    receive after 500 -> ok end,
+    %% Shutdown write side to send FIN, allowing buffered data to drain
+    %% This is non-blocking and lets TCP stack finish transmitting
+    case socket:shutdown(Socket, write) of
+        ok -> ok;
+        {error, _} -> ok  %% Ignore errors (socket may already be closed)
+    end,
+    %% Brief delay then close - FIN has been queued
+    receive after 50 -> ok end,
     try_close(Socket).
 
 %% @private

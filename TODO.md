@@ -83,6 +83,19 @@ Tracking document for memory leak and VM stability issues identified during code
 
 ---
 
+## Code Quality Improvements
+
+### 9. ✅ Replace custom iolist_length with erlang:iolist_size
+**File:** `src/httpd.erl` line 582
+
+**Problem:** Used custom `iolist_length/1` function instead of the standard `erlang:iolist_size/1` BIF which is available in AtomVM. Custom implementation works correctly but adds unnecessary code maintenance burden.
+
+**Solution:** Replace with `erlang:iolist_size/1` and remove custom function.
+
+**Status:** Fixed - replaced custom implementation with standard BIF, all tests passing.
+
+---
+
 ## Progress Log
 
 | Date | Issue # | Status | Notes |
@@ -90,6 +103,8 @@ Tracking document for memory leak and VM stability issues identified during code
 | 2024-12-07 | - | - | Initial review and documentation |
 | 2024-12-07 | 5 | ✅ | Fixed map update operator in httpd.erl |
 | 2024-12-07 | 1 | ✅ | Fixed accept loop crash recovery in gen_tcp_server.erl |
+| 2026-01-11 | 9 | ✅ | Replaced custom iolist_length with erlang:iolist_size/1 |
+| 2026-01-11 | - | - | Added comprehensive iolist handler tests |
 
 ---
 

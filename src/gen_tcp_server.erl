@@ -52,6 +52,17 @@
 %% Smaller chunks work better with lwIP's limited buffers
 -define(MAX_SEND_CHUNK, 1460).  %% TCP MSS - fits in single packet without fragmentation
 
+%% Socket send retry delay (ms). In tests we override to avoid slowing the suite.
+-define(SEND_RETRY_DELAY_MS, 20).
+
+-ifdef(TEST).
+-undef(SEND_RETRY_DELAY_MS).
+-define(SEND_RETRY_DELAY_MS, 0).
+
+%% Expose a test seam to validate partial-send handling without needing a real socket.
+-export([try_send_binary_fun/2]).
+-endif.
+
 %%
 %% API
 %%
@@ -201,16 +212,24 @@ try_send_iolist(Socket, [H | T]) ->
 try_send_binary(_Socket, <<>>) ->
     ok;
 try_send_binary(Socket, Packet) when is_binary(Packet) ->
+    try_send_binary_fun(fun(Chunk) -> socket:send(Socket, Chunk) end, Packet).
+
+%% @private
+%% Same send loop but with an injectable send fun for testing.
+%% SendFun must return the same shapes as socket:send/2.
+try_send_binary_fun(_SendFun, <<>>) ->
+    ok;
+try_send_binary_fun(SendFun, Packet) when is_function(SendFun, 1), is_binary(Packet) ->
     TotalSize = byte_size(Packet),
     ChunkSize = erlang:min(TotalSize, ?MAX_SEND_CHUNK),
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
-    case socket:send(Socket, Chunk) of
+    case SendFun(Chunk) of
         ok ->
-            try_send_binary(Socket, Rest);
+            try_send_binary_fun(SendFun, Rest);
         {ok, Remaining} when is_binary(Remaining) ->
             %% Partial send - AtomVM may return the remaining (unsent) bytes as a binary.
-            case try_send_binary(Socket, Remaining) of
-                ok -> try_send_binary(Socket, Rest);
+            case try_send_binary_fun(SendFun, Remaining) of
+                ok -> try_send_binary_fun(SendFun, Rest);
                 Error -> Error
             end;
         {ok, SentBytes} when is_integer(SentBytes), SentBytes >= 0 ->
@@ -219,31 +238,31 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
             case SentBytes of
                 0 ->
                     %% No progress; treat like wouldblock and retry.
-                    receive after 20 -> ok end,
-                    try_send_binary(Socket, Packet);
+                    receive after ?SEND_RETRY_DELAY_MS -> ok end,
+                    try_send_binary_fun(SendFun, Packet);
                 _ when SentBytes < byte_size(Chunk) ->
                     UnsentBytes = byte_size(Chunk) - SentBytes,
                     <<_Sent:SentBytes/binary, Unsent:UnsentBytes/binary>> = Chunk,
-                    case try_send_binary(Socket, Unsent) of
-                        ok -> try_send_binary(Socket, Rest);
+                    case try_send_binary_fun(SendFun, Unsent) of
+                        ok -> try_send_binary_fun(SendFun, Rest);
                         Error -> Error
                     end;
                 _ when SentBytes =:= byte_size(Chunk) ->
-                    try_send_binary(Socket, Rest);
+                    try_send_binary_fun(SendFun, Rest);
                 _ ->
                     io:format("socket:send unexpected partial result: ~p~n", [SentBytes]),
                     {error, badarg}
             end;
         {error, eagain} ->
             %% Socket buffer full, brief pause and retry
-            receive after 20 -> ok end,
-            try_send_binary(Socket, Packet);
+            receive after ?SEND_RETRY_DELAY_MS -> ok end,
+            try_send_binary_fun(SendFun, Packet);
         {error, ewouldblock} ->
-            receive after 20 -> ok end,
-            try_send_binary(Socket, Packet);
+            receive after ?SEND_RETRY_DELAY_MS -> ok end,
+            try_send_binary_fun(SendFun, Packet);
         {error, timeout} ->
-            receive after 20 -> ok end,
-            try_send_binary(Socket, Packet);
+            receive after ?SEND_RETRY_DELAY_MS -> ok end,
+            try_send_binary_fun(SendFun, Packet);
         {error, closed} ->
             io:format("socket:send error: closed~n"),
             {error, closed};

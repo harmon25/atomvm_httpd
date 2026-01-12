@@ -208,16 +208,11 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
         ok ->
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
-            io:format("socket:send partial send: ~p~n", [Remaining]),
+            % io:format("socket:send partial send: ~p~n", [Remaining]),
             %% Partial send - send remaining then continue with rest
-            case is_binary(Remaining) of
-                true ->
-                    case try_send_binary(Socket, Remaining) of
-                        ok -> try_send_binary(Socket, Rest);
-                        Error -> Error
-                    end;
-                false ->
-                    {error, {unexpected_return, Remaining}}
+             case try_send_binary(Socket, Remaining) of
+                ok -> try_send_binary(Socket, Rest);
+                Error -> Error
             end;
         {error, eagain} ->
             %% Socket buffer full, brief pause and retry

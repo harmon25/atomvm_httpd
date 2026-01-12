@@ -285,12 +285,10 @@ call_http_req_handler(Socket, HttpRequest, State) ->
             NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
             {noreply, NewState};
         %% reply
-        {reply, Reply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {reply, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply), NewState};
-        {reply, ReplyHeaders, Reply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {reply, create_reply(?OK, ReplyHeaders, Reply), NewState};
+        {reply, Reply, _NewHandlerState} ->
+            {reply, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply), State};
+        {reply, ReplyHeaders, Reply, _NewHandlerState} ->
+            {reply, create_reply(?OK, ReplyHeaders, Reply), State};
         %% close
         close ->
             {close, State};

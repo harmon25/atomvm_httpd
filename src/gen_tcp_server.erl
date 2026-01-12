@@ -128,46 +128,31 @@ handle_info({tcp_closed, Socket}, State) ->
     #state{handler=Handler, handler_state=HandlerState} = State,
     NewHandlerState = Handler:handle_tcp_closed(Socket, HandlerState),
     {noreply, State#state{handler_state=NewHandlerState}};
-handle_info({tcp, Socket, Packet}, State) ->
+handle_info({tcp, Socket, Packet, LoopPid}, State) ->
     #state{handler=Handler, handler_state=HandlerState} = State,
     ?TRACE("received packet: len(~p) from ~p", [erlang:byte_size(Packet), socket:peername(Socket)]),
     case Handler:handle_receive(Socket, Packet, HandlerState) of
         {reply, ResponsePacket, ResponseState} ->
             ?TRACE("Sending reply to endpoint ~p", [socket:peername(Socket)]),
-            %% Spawn send to avoid blocking other requests
-            spawn(fun() ->
-                case try_send(Socket, ResponsePacket) of
-                    ok -> ok;
-                    {error, _} -> ok
-                end
-            end),
+            %% Send response back to loop process for sending
+            LoopPid ! {send, ResponsePacket, keep_open},
             {noreply, State#state{handler_state=ResponseState}};
         {noreply, ResponseState} ->
             ?TRACE("no reply", []),
+            LoopPid ! continue,
             {noreply, State#state{handler_state=ResponseState}};
         {close, ResponsePacket} ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
-            %% Spawn send to avoid blocking other requests
-            spawn(fun() ->
-                Size = erlang:iolist_size(ResponsePacket),
-                io:format("Starting send: ~p bytes~n", [Size]),
-                case try_send(Socket, ResponsePacket) of
-                    ok ->
-                        io:format("Finished send: ~p bytes~n", [Size]),
-                        graceful_close(Socket);
-                    {error, Reason} ->
-                        io:format("Send failed after starting: ~p~n", [Reason]),
-                        try_close(Socket)
-                end
-            end),
+            %% Send response back to loop process for sending, then close
+            LoopPid ! {send, ResponsePacket, close},
             {noreply, State};
         close  ->
             ?TRACE("Closing socket ~p", [Socket]),
-            try_close(Socket),
+            LoopPid ! close,
             {noreply, State};
         _SomethingElse ->
             ?TRACE("Unexpected response from handler ~p: ~p", [Handler, _SomethingElse]),
-            try_close(Socket),
+            LoopPid ! close,
             {noreply, State}
     end;
 handle_info(Info, State) ->
@@ -214,7 +199,6 @@ try_send_iolist(Socket, [H | T]) ->
     end.
 
 try_send_binary(_Socket, <<>>) ->
-    io:format("Send complete~n"),
     ok;
 try_send_binary(Socket, Packet) when is_binary(Packet) ->
     TotalSize = byte_size(Packet),
@@ -225,29 +209,23 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
             try_send_binary(Socket, Rest);
         {ok, Remaining} ->
             %% Partial send - send remaining then continue with rest
-            io:format("Partial: ~p bytes~n", [byte_size(Remaining)]),
             case try_send_binary(Socket, Remaining) of
                 ok -> try_send_binary(Socket, Rest);
                 Error -> Error
             end;
         {error, eagain} ->
             %% Socket buffer full, brief pause and retry
-            io:format("eagain~n"),
             receive after 5 -> ok end,
             try_send_binary(Socket, Packet);
         {error, ewouldblock} ->
-            io:format("ewouldblock~n"),
             receive after 5 -> ok end,
             try_send_binary(Socket, Packet);
         {error, timeout} ->
-            io:format("timeout~n"),
             receive after 5 -> ok end,
             try_send_binary(Socket, Packet);
         {error, closed} ->
-            io:format("closed~n"),
             {error, closed};
         {error, ebadf} ->
-            io:format("ebadf~n"),
             {error, ebadf};
         {error, Reason} ->
             {error, Reason}
@@ -271,8 +249,9 @@ try_close(Socket) ->
 
 %% @private
 graceful_close(Socket) ->
-    %% Brief delay to let TCP finish, then close
-    receive after 50 -> ok end,
+    %% Shutdown write side to signal we're done, then wait for TCP to flush
+    _ = socket:shutdown(Socket, write),
+    receive after 100 -> ok end,
     try_close(Socket).
 
 %% @private
@@ -306,16 +285,28 @@ loop(ControllingProcess, Connection) ->
     case socket:recv(Connection) of
         {ok, Data} ->
             ?TRACE("Received data ~p on connection ~p", [Data, Connection]),
-            ControllingProcess ! {tcp, Connection, Data},
-            loop(ControllingProcess, Connection);
+            ControllingProcess ! {tcp, Connection, Data, self()},
+            %% Wait for response from gen_server
+            receive
+                {send, ResponsePacket, Action} ->
+                    case try_send(Connection, ResponsePacket) of
+                        ok ->
+                            case Action of
+                                keep_open -> loop(ControllingProcess, Connection);
+                                close -> graceful_close(Connection)
+                            end;
+                        {error, _} ->
+                            try_close(Connection)
+                    end;
+                continue ->
+                    loop(ControllingProcess, Connection);
+                close ->
+                    try_close(Connection)
+            end;
         {error, closed} ->
-            io:format("recv: closed~n"),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
-        {error, Reason} ->
-            %% Don't close the socket here! The handler may still be sending.
-            %% Just notify the controlling process and let it handle cleanup.
-            io:format("recv error: ~p~n", [Reason]),
+        {error, _Reason} ->
             ControllingProcess ! {tcp_closed, Connection},
             ok
     end.

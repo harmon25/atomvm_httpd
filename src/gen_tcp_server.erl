@@ -255,7 +255,7 @@ try_close(Socket) ->
 graceful_close(Socket) ->
     %% Shutdown write side to signal we're done, then wait for TCP to flush
     _ = socket:shutdown(Socket, write),
-    receive after 100 -> ok end,
+    receive after 1000 -> ok end,
     try_close(Socket).
 
 %% @private

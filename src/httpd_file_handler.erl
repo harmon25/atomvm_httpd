@@ -51,7 +51,12 @@ handle_http_req(#{method := get} = HttpRequest, State) ->
     AcceptEncoding = get_accept_encoding(HttpRequest),
     AcceptsGzip = accepts_gzip(AcceptEncoding),
     try
-        serve_file(App, FullPath, ResolvedPath, AcceptsGzip)
+        case serve_file(App, FullPath, ResolvedPath, AcceptsGzip) of
+            {close, Headers, Body} ->
+                {reply, Headers, Body, State};
+            Other ->
+                Other
+        end
     catch
         _:Reason ->
             io:format("httpd_file_handler: error reading file ~p: ~p~n", [FullPath, Reason]),

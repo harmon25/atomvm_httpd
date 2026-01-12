@@ -213,19 +213,25 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
                 ok -> try_send_binary(Socket, Rest);
                 Error -> Error
             end;
-        {ok, RemainingBytes} when is_integer(RemainingBytes), RemainingBytes >= 0 ->
-            %% Partial send - some implementations may return the count of unsent bytes.
-            %% In that case, retry sending the unsent tail of this Chunk.
-            case RemainingBytes =< byte_size(Chunk) of
-                true ->
-                    SentBytes = byte_size(Chunk) - RemainingBytes,
-                    <<_Sent:SentBytes/binary, Unsent:RemainingBytes/binary>> = Chunk,
+        {ok, SentBytes} when is_integer(SentBytes), SentBytes >= 0 ->
+            %% Partial send - some implementations return the count of bytes actually sent.
+            %% Retry sending the unsent tail of this Chunk.
+            case SentBytes of
+                0 ->
+                    %% No progress; treat like wouldblock and retry.
+                    receive after 20 -> ok end,
+                    try_send_binary(Socket, Packet);
+                _ when SentBytes < byte_size(Chunk) ->
+                    UnsentBytes = byte_size(Chunk) - SentBytes,
+                    <<_Sent:SentBytes/binary, Unsent:UnsentBytes/binary>> = Chunk,
                     case try_send_binary(Socket, Unsent) of
                         ok -> try_send_binary(Socket, Rest);
                         Error -> Error
                     end;
-                false ->
-                    io:format("socket:send unexpected partial result: ~p~n", [RemainingBytes]),
+                _ when SentBytes =:= byte_size(Chunk) ->
+                    try_send_binary(Socket, Rest);
+                _ ->
+                    io:format("socket:send unexpected partial result: ~p~n", [SentBytes]),
                     {error, badarg}
             end;
         {error, eagain} ->

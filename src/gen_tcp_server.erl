@@ -291,11 +291,27 @@ try_close(Socket) ->
     end.
 
 %% @private
-graceful_close(Socket) ->
-    %% Shutdown write side to signal we're done, then wait for TCP to flush
+graceful_close(ControllingProcess, Socket) ->
+    %% On some platforms (notably lwIP-based), a close can be abortive and drop
+    %% bytes that were "sent" but not yet drained from buffers.
+    %%
+    %% Prefer a half-close (FIN) and wait for the peer to close.
     _ = socket:shutdown(Socket, write),
-    receive after 1000 -> ok end,
-    try_close(Socket).
+    wait_for_peer_close(ControllingProcess, Socket).
+
+%% @private
+wait_for_peer_close(ControllingProcess, Socket) ->
+    case socket:recv(Socket) of
+        {ok, _Data} ->
+            %% Ignore any data from peer; we already indicated Connection: close.
+            wait_for_peer_close(ControllingProcess, Socket);
+        {error, closed} ->
+            ControllingProcess ! {tcp_closed, Socket},
+            ok;
+        {error, _Reason} ->
+            ControllingProcess ! {tcp_closed, Socket},
+            ok
+    end.
 
 %% @private
 set_socket_options(Socket, SocketOptions) ->
@@ -336,7 +352,7 @@ loop(ControllingProcess, Connection) ->
                         ok ->
                             case Action of
                                 keep_open -> loop(ControllingProcess, Connection);
-                                close -> graceful_close(Connection)
+                                close -> graceful_close(ControllingProcess, Connection)
                             end;
                         {error, _} ->
                             try_close(Connection)

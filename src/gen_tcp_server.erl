@@ -149,10 +149,14 @@ handle_info({tcp, Socket, Packet}, State) ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
             %% Spawn send to avoid blocking other requests
             spawn(fun() ->
+                Size = erlang:iolist_size(ResponsePacket),
+                io:format("Starting send: ~p bytes~n", [Size]),
                 case try_send(Socket, ResponsePacket) of
                     ok ->
+                        io:format("Finished send: ~p bytes~n", [Size]),
                         graceful_close(Socket);
-                    {error, _} ->
+                    {error, Reason} ->
+                        io:format("Send failed after starting: ~p~n", [Reason]),
                         try_close(Socket)
                 end
             end),
@@ -305,11 +309,13 @@ loop(ControllingProcess, Connection) ->
             ControllingProcess ! {tcp, Connection, Data},
             loop(ControllingProcess, Connection);
         {error, closed} ->
+            io:format("recv: closed~n"),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
-        {error, _Reason} ->
+        {error, Reason} ->
             %% Don't close the socket here! The handler may still be sending.
             %% Just notify the controlling process and let it handle cleanup.
+            io:format("recv error: ~p~n", [Reason]),
             ControllingProcess ! {tcp_closed, Connection},
             ok
     end.

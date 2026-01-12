@@ -207,12 +207,26 @@ try_send_binary(Socket, Packet) when is_binary(Packet) ->
     case socket:send(Socket, Chunk) of
         ok ->
             try_send_binary(Socket, Rest);
-        {ok, Remaining} ->
-            % io:format("socket:send partial send: ~p~n", [Remaining]),
-            %% Partial send - send remaining then continue with rest
-             case try_send_binary(Socket, Remaining) of
+        {ok, Remaining} when is_binary(Remaining) ->
+            %% Partial send - AtomVM may return the remaining (unsent) bytes as a binary.
+            case try_send_binary(Socket, Remaining) of
                 ok -> try_send_binary(Socket, Rest);
                 Error -> Error
+            end;
+        {ok, RemainingBytes} when is_integer(RemainingBytes), RemainingBytes >= 0 ->
+            %% Partial send - some implementations may return the count of unsent bytes.
+            %% In that case, retry sending the unsent tail of this Chunk.
+            case RemainingBytes =< byte_size(Chunk) of
+                true ->
+                    SentBytes = byte_size(Chunk) - RemainingBytes,
+                    <<_Sent:SentBytes/binary, Unsent:RemainingBytes/binary>> = Chunk,
+                    case try_send_binary(Socket, Unsent) of
+                        ok -> try_send_binary(Socket, Rest);
+                        Error -> Error
+                    end;
+                false ->
+                    io:format("socket:send unexpected partial result: ~p~n", [RemainingBytes]),
+                    {error, badarg}
             end;
         {error, eagain} ->
             %% Socket buffer full, brief pause and retry

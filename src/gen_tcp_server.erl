@@ -292,11 +292,9 @@ try_close(Socket) ->
 
 %% @private
 graceful_close(ControllingProcess, Socket) ->
-    %% On some platforms (notably lwIP-based), a close can be abortive and drop
-    %% bytes that were "sent" but not yet drained from buffers.
-    %%
-    %% Prefer a half-close (FIN) and wait for the peer to close.
-    _ = socket:shutdown(Socket, write),
+    %% Some stacks may treat shutdown/close as abortive w.r.t. queued TX data.
+    %% We already send `Connection: close`, so let the client close once it has
+    %% read `Content-Length` bytes. Keep the socket open and wait.
     wait_for_peer_close(ControllingProcess, Socket).
 
 %% @private

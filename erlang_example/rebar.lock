@@ -1,7 +1,4 @@
 [{<<"atomvm_httpd">>,
   {git,"https://github.com/harmon25/atomvm_httpd.git",
-       {ref,"ea36293b31f6979996b99ba6889a22db9841799a"}},
-  0},
- {<<"elixir">>,{iex_dep,<<"elixir">>,<<>>},1},
- {<<"logger">>,{iex_dep,<<"logger">>,<<>>},1},
- {<<"mix">>,{iex_dep,<<"mix">>,<<>>},1}].
+       {ref,"0eb8ff00cf9d8d8816101a37d8c79825a69ede13"}},
+  0}].

@@ -47,17 +47,27 @@
     addr => any
 }).
 -define(DEFAULT_SOCKET_OPTIONS, #{
-    {socket, reuseaddr} => true
+    {socket, reuseaddr} => true,
+    %% Linger: wait up to 5 seconds for data to be sent before closing
+    {socket, linger} => #{onoff => true, linger => 5}
 }).
 %% Smaller chunks work better with lwIP's limited buffers
--define(MAX_SEND_CHUNK, 1460).  %% TCP MSS - fits in single packet without fragmentation
+%% ESP32 lwIP has small TX buffers - smaller chunks reduce buffer pressure
+-define(MAX_SEND_CHUNK, 1024).
 
 %% Socket send retry delay (ms). In tests we override to avoid slowing the suite.
--define(SEND_RETRY_DELAY_MS, 20).
+%% On embedded platforms, a small delay between chunks helps lwIP drain buffers.
+-define(SEND_RETRY_DELAY_MS, 10).
+
+%% Inter-chunk delay (ms) to allow lwIP to drain TX buffers on ESP32.
+%% Set to 0 for tests on fast host systems.
+-define(INTER_CHUNK_DELAY_MS, 5).
 
 -ifdef(TEST).
 -undef(SEND_RETRY_DELAY_MS).
 -define(SEND_RETRY_DELAY_MS, 0).
+-undef(INTER_CHUNK_DELAY_MS).
+-define(INTER_CHUNK_DELAY_MS, 0).
 
 %% Expose a test seam to validate partial-send handling without needing a real socket.
 -export([try_send_binary_fun/2]).
@@ -225,6 +235,11 @@ try_send_binary_fun(SendFun, Packet) when is_function(SendFun, 1), is_binary(Pac
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
     case SendFun(Chunk) of
         ok ->
+            %% Small delay between chunks to let lwIP drain TX buffer
+            case Rest of
+                <<>> -> ok;
+                _ -> receive after ?INTER_CHUNK_DELAY_MS -> ok end
+            end,
             try_send_binary_fun(SendFun, Rest);
         {ok, Remaining} when is_binary(Remaining) ->
             %% Partial send - AtomVM may return the remaining (unsent) bytes as a binary.
@@ -292,24 +307,13 @@ try_close(Socket) ->
 
 %% @private
 graceful_close(ControllingProcess, Socket) ->
-    %% Some stacks may treat shutdown/close as abortive w.r.t. queued TX data.
-    %% We already send `Connection: close`, so let the client close once it has
-    %% read `Content-Length` bytes. Keep the socket open and wait.
-    wait_for_peer_close(ControllingProcess, Socket).
-
-%% @private
-wait_for_peer_close(ControllingProcess, Socket) ->
-    case socket:recv(Socket) of
-        {ok, _Data} ->
-            %% Ignore any data from peer; we already indicated Connection: close.
-            wait_for_peer_close(ControllingProcess, Socket);
-        {error, closed} ->
-            ControllingProcess ! {tcp_closed, Socket},
-            ok;
-        {error, _Reason} ->
-            ControllingProcess ! {tcp_closed, Socket},
-            ok
-    end.
+    %% Shutdown write side to signal we're done sending, then close.
+    %% Give lwIP a moment to flush final data before closing.
+    _ = socket:shutdown(Socket, write),
+    receive after 10 -> ok end,
+    try_close(Socket),
+    ControllingProcess ! {tcp_closed, Socket},
+    ok.
 
 %% @private
 set_socket_options(Socket, SocketOptions) ->
@@ -353,17 +357,21 @@ loop(ControllingProcess, Connection) ->
                                 close -> graceful_close(ControllingProcess, Connection)
                             end;
                         {error, _} ->
-                            try_close(Connection)
+                            try_close(Connection),
+                            ControllingProcess ! {tcp_closed, Connection}
                     end;
                 continue ->
                     loop(ControllingProcess, Connection);
                 close ->
-                    try_close(Connection)
+                    try_close(Connection),
+                    ControllingProcess ! {tcp_closed, Connection}
             end;
         {error, closed} ->
+            try_close(Connection),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
         {error, _Reason} ->
+            try_close(Connection),
             ControllingProcess ! {tcp_closed, Connection},
             ok
     end.

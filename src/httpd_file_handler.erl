@@ -51,12 +51,7 @@ handle_http_req(#{method := get} = HttpRequest, State) ->
     AcceptEncoding = get_accept_encoding(HttpRequest),
     AcceptsGzip = accepts_gzip(AcceptEncoding),
     try
-        case serve_file(App, FullPath, ResolvedPath, AcceptsGzip) of
-            {close, Headers, Body} ->
-                {reply, Headers, Body, State};
-            Other ->
-                Other
-        end
+        serve_file(App, FullPath, ResolvedPath, AcceptsGzip)
     catch
         _:Reason ->
             io:format("httpd_file_handler: error reading file ~p: ~p~n", [FullPath, Reason]),
@@ -164,10 +159,23 @@ get_content_type([Filename|_]) ->
             "application/octet-stream"
     end.
 
-get_suffix(Filename) ->
-    case string:split(binary_to_list(Filename), ".") of
-        [_Basename, Suffix] ->
-            Suffix;
-        _ ->
-            undefined
+get_suffix(Filename) when is_binary(Filename) ->
+    get_suffix(binary_to_list(Filename));
+get_suffix(Filename) when is_list(Filename) ->
+    %% Find the last '.' and return everything after it
+    case lists:reverse(Filename) of
+        [] -> undefined;
+        Reversed ->
+            case take_until_dot(Reversed, []) of
+                undefined -> undefined;
+                Suffix -> Suffix
+            end
     end.
+
+%% Take characters until we hit a dot, return the suffix
+take_until_dot([], _Acc) ->
+    undefined;
+take_until_dot([$. | _Rest], Acc) ->
+    Acc;
+take_until_dot([C | Rest], Acc) ->
+    take_until_dot(Rest, [C | Acc]).

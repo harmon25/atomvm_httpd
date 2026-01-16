@@ -13,7 +13,98 @@ beer in return.   Fred Dushin
 <html>
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
-	<link rel="stylesheet" href="w3.css">
+	<style>
+		body {
+			font-family: Arial, sans-serif;
+			margin: 0;
+			background: #f5f5f5;
+		}
+		.nav-bar {
+			display: flex;
+			background: #607d8b;
+			color: #fff;
+			align-items: center;
+			padding: 0 10px;
+			height: 48px;
+			position: relative;
+		}
+		.nav-bar button {
+			background: none;
+			border: none;
+			color: #fff;
+			padding: 12px 18px;
+			cursor: pointer;
+			font-size: 16px;
+			outline: none;
+			transition: background 0.2s;
+		}
+		.nav-bar button.active, .nav-bar button:hover {
+			background: #455a64;
+		}
+		#icon {
+			margin-left: auto;
+			padding: 5px 0 5px 10px;
+		}
+		.panel {
+			display: none;
+			background: #fff;
+			margin: 24px auto 0 auto;
+			max-width: 600px;
+			border-radius: 6px;
+			box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+			padding: 24px;
+			animation: fadein 0.7s;
+		}
+		.panel.active {
+			display: block;
+		}
+		@keyframes fadein {
+			from { opacity: 0; }
+			to { opacity: 1; }
+		}
+		table {
+			width: 100%;
+			border-collapse: collapse;
+			margin-top: 12px;
+		}
+		th, td {
+			padding: 8px 10px;
+			border-bottom: 1px solid #e0e0e0;
+			text-align: left;
+		}
+		tr:last-child td {
+			border-bottom: none;
+		}
+		#loader {
+			position: absolute;
+			left: 50%;
+			top: 50%;
+			z-index: 1;
+			width: 120px;
+			height: 120px;
+			margin: -75px 0 0 -75px;
+			border: 16px solid #f3f3f3;
+			border-radius: 50%;
+			border-top: 16px solid #3498db;
+			animation: spin 2s ease infinite;
+		}
+		@keyframes spin {
+			0% { transform: rotate(0deg); }
+			100% { transform: rotate(360deg); }
+		}
+		#footer {
+			background: #009688;
+			color: #fff;
+			padding: 12px 24px;
+			position: fixed;
+			left: 0;
+			bottom: 0;
+			width: 100%;
+			display: flex;
+			justify-content: space-between;
+			font-size: 15px;
+		}
+	</style>
 	<head>
 		<title>AtomVM Web Console</title>
 		<style>
@@ -67,99 +158,38 @@ beer in return.   Fred Dushin
   			}
 		</style>
 	</head>
-	<body onload="timedShowContents()">
+	<body>
 		<div id="loader"></div>
-		<div id="content" class="w3-panel animate-bottom" style="display:none;">
-			<div id="tabs" class="w3-container" style="min-height:600px">
-
-				<div class="w3-bar w3-blue-gray">
-					<button class="w3-bar-item w3-button" onclick="openPanel(event, 'about')">About</button>
-					<button class="w3-bar-item w3-button" onclick="openPanel(event, 'system')">System</button>
-					<button class="w3-bar-item w3-button" onclick="openPanel(event, 'memory')">Memory</button>
+		<div id="content" style="display:none;">
+			<div id="tabs" style="min-height:600px">
+				<div class="nav-bar">
+					<button class="tab-btn active" data-panel="about">About</button>
+					<button class="tab-btn" data-panel="system">System</button>
+					<button class="tab-btn" data-panel="memory">Memory</button>
 					<div id="icon"><img src="favicon.ico" alt="AtomVM logo" width="30" height="30" /></div>
 				</div>
-
-				<div id="about" class="w3-panel w3-animate-opacity wc-panel">
+				<div id="about" class="panel active">
 					<div id="about-view">
-						Welcome to the AtomVM web console.
-
+						Welcome to the AtomVM web console.<br><br>
 						Use this console to explore the current state of your device.
 					</div>
 				</div>
-				<div id="system" class="w3-panel w3-animate-opacity wc-panel" style="display:none">
-					<div id="system-view" class="wlan">
-						<script type="text/template" id="system-tmpl">
-							<table class="w3-table-all w3-card-4">
-								<tr><td>platform</td><td><%= platform %></td></tr>
-								<tr><td>system_architecture</td><td><%= system_architecture %></td></tr>
-								<tr><td>word_size</td><td><%= word_size %></td></tr>
-								<tr><td>chip_model</td><td><%= chip_model %></td></tr>
-								<tr><td>chip_cores</td><td><%= chip_cores %></td></tr>
-								<tr><td>chip_features</td><td><%= chip_features %></td></tr>
-								<tr><td>chip_revision</td><td><%= chip_revision %></td></tr>
-								<tr><td>atomvm_version</td><td><%= atomvm_version %></td></tr>
-								<tr><td>esp_idf_version</td><td><%= esp_idf_version %></td></tr>
-							</table>
-						</script>
+				<div id="system" class="panel">
+					<div id="system-view">
+						<!-- System info will be rendered here -->
 					</div>
 				</div>
-				<div id="memory" class="w3-panel w3-animate-opacity wc-panel" style="display:none">
-					<div id="memory-view" class="wlan">
-						<script type="text/template" id="memory-tmpl">
-							<table class="w3-table-all w3-card-4">
-								<tr><td>atom_count</td><td><%= atom_count %></td></tr>
-								<tr><td>port_count</td><td><%= port_count %></td></tr>
-								<tr><td>process_count</td><td><%= process_count %></td></tr>
-								<tr><td>esp32_free_heap_size</td><td><%= esp32_free_heap_size %></td></tr>
-								<tr><td>esp32_largest_free_block</td><td><%= esp32_largest_free_block %></td></tr>
-								<tr><td>esp32_minimum_free_size</td><td><%= esp32_minimum_free_size %></td></tr>
-							</table>
-						</script>
+				<div id="memory" class="panel">
+					<div id="memory-view">
+						<!-- Memory info will be rendered here -->
 					</div>
 				</div>
 			</div>
-			<div id="footer" class="w3-row w3-teal">
-				<div class="w3-container w3-threequarter">
-					AtomVM Web Console
-				</div>
-				<div class="w3-container w3-quarter">
-				</div>
+			<div id="footer">
+				<div>AtomVM Web Console</div>
+				<div></div>
 			</div>
 		</div>
-
-		<script>
-			function openPanel(evt, panelName) {
-				var i;
-				var x = document.getElementsByClassName("wc-panel");
-				for (i = 0; i < x.length; i++) {
-					x[i].style.display = "none";
-				}
-				tablinks = document.getElementsByClassName("w3-bar-item");
-					for (i = 0; i < x.length; i++) {
-						tablinks[i].className = tablinks[i].className.replace(" w3-black", "");
-				}
-				document.getElementById(panelName).style.display = "block";
-				evt.currentTarget.className += " w3-black";
-			}
-			function timedShowContents() {
-				setTimeout(showContents, 1000);
-			}
-			function showContents() {
-				document.getElementById("loader").style.display = "none";
-				document.getElementById("content").style.display = "block";
-			}
-			function closeApConfigModal(){
-				document.getElementById('ap-config-modal').style.display='none'
-			}
-			function saveApConfig(){
-				this.closeApConfigModal()
-			}
-		</script>
-
-		<script src="js/lib/jquery-3.1.1-min.js"></script>
-		<script src="js/lib/underscore-1.8.3-min.js"></script>
-		<script src="js/lib/backbone-1.3.3-min.js"></script>
-
 		<script src="js/app.js"></script>
 	</body>
 </html>

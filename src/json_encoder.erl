@@ -52,7 +52,7 @@ encode(null) ->
 encode(undefined) ->
     <<"null">>;
 encode(Value) when is_atom(Value) ->
-    [$", erlang:atom_to_binary(Value, latin1), $"];
+    [$", erlang:atom_to_binary(Value, utf8), $"];
 encode(Value) when is_binary(Value) ->
     [$", Value, $"];
 encode(Value) when is_float(Value) ->
@@ -61,21 +61,18 @@ encode(Value) when is_integer(Value) ->
     erlang:integer_to_binary(Value);
 encode(Value) when is_map(Value) ->
     encode_map(Value);
+encode(V) when is_list(V) ->
+    encode(V, []);
 encode(V) ->
-    case is_string(V) of
-        true ->
-            [$",erlang:list_to_binary(V), $"];
-        _ ->
-            encode(V, [])
-    end.
+    encode(V, []).
 
 encode([{_K, _V} | _T] = L, []) ->
     encode(L, ${);
 encode([{Key, Value} | []], Acc) ->
-    Encoded = [$", encode_key(Key), "\":", encode(Value), $}],
+    Encoded = [$", encode_key(Key), "\": ", encode(Value), $}],
     [Acc | Encoded];
 encode([{Key, Value} | Tail], Acc) ->
-    Encoded = [$", encode_key(Key), "\":", encode(Value), $,],
+    Encoded = [$", encode_key(Key), "\": ", encode(Value), $,],
     encode(Tail, [Acc | Encoded]);
 encode([_V | _T] = L, []) ->
     encode(L, $[);
@@ -87,16 +84,11 @@ encode([Value | Tail], Acc) ->
     encode(Tail, [Acc | Encoded]).
 
 encode_key(Key) when is_atom(Key) ->
-    erlang:atom_to_binary(Key, latin1);
+    erlang:atom_to_binary(Key, utf8);
 encode_key(Key) when is_binary(Key) ->
     Key.
 
-is_string([]) ->
-    true;
-is_string([H|T]) when is_integer(H) andalso 0 =< H andalso H =< 255 ->
-    is_string(T);
-is_string(_) ->
-    false.
+
 
 encode_map(Map) ->
     iterate_entries(maps:next(maps:iterator(Map)), 0, "{").

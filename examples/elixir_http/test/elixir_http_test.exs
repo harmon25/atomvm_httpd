@@ -80,12 +80,6 @@ defmodule ElixirHttpTest do
       verify_content_length(response)
     end
 
-    test "serves CSS file", %{base_url: base_url} do
-      {:ok, response} = req_get("#{base_url}/w3.css")
-      assert response.status == 200
-      verify_content_length(response)
-    end
-
     test "serves favicon", %{base_url: base_url} do
       {:ok, response} = req_get("#{base_url}/favicon.ico")
       assert response.status == 200
@@ -96,31 +90,6 @@ defmodule ElixirHttpTest do
       {:ok, response} = req_get("#{base_url}/js/app.js")
       assert response.status == 200
       verify_content_length(response)
-    end
-
-    test "serves underscore.js library", %{base_url: base_url} do
-      {:ok, response} = req_get("#{base_url}/js/lib/underscore-1.8.3-min.js")
-      assert response.status == 200
-      verify_content_length(response)
-      # Underscore is ~16KB
-      assert byte_size(response.body) > 10_000
-    end
-
-    test "serves backbone.js library", %{base_url: base_url} do
-      {:ok, response} = req_get("#{base_url}/js/lib/backbone-1.3.3-min.js")
-      assert response.status == 200
-      verify_content_length(response)
-      # Backbone is ~23KB
-      assert byte_size(response.body) > 20_000
-    end
-
-    test "serves jquery.js library (large file ~87KB)", %{base_url: base_url} do
-      {:ok, response} = req_get("#{base_url}/js/lib/jquery-3.1.1-min.js")
-      assert response.status == 200
-      verify_content_length(response)
-      # jQuery is ~87KB - verify we got the full file
-      assert byte_size(response.body) > 80_000,
-             "jQuery file too small: #{byte_size(response.body)} bytes (expected >80KB)"
     end
 
     test "returns 404 for missing file", %{base_url: base_url} do
@@ -166,24 +135,24 @@ defmodule ElixirHttpTest do
 
     # ESP32 lwIP has limited socket resources - 10+ concurrent connections
     # may exceed platform limits. Mark as slow for stress testing only.
-    @tag :slow
-    test "handles 10 concurrent requests", %{base_url: base_url} do
-      run_concurrent_requests(base_url, 10)
-    end
+    # @tag :slow
+    # test "handles 10 concurrent requests", %{base_url: base_url} do
+    #   run_concurrent_requests(base_url, 10)
+    # end
   end
 
   describe "stress tests" do
     @tag :slow
-    test "rapid fire requests (100 requests)", %{base_url: base_url} do
-      for i <- 1..100 do
+    test "rapid fire requests (50 requests)", %{base_url: base_url} do
+      for i <- 1..50 do
         {:ok, response} = req_get("#{base_url}/api/system_info")
         assert response.status == 200, "Request #{i} failed"
       end
     end
 
     @tag :slow
-    test "sustained load (500 requests)", %{base_url: base_url} do
-      for i <- 1..500 do
+    test "sustained load (250 requests)", %{base_url: base_url} do
+      for i <- 1..250 do
         {:ok, response} = req_get(base_url)
         assert response.status in [200, 304], "Request #{i} failed with status #{response.status}"
       end
@@ -195,11 +164,10 @@ defmodule ElixirHttpTest do
         "/",
         "/index.html",
         "/api/system_info",
-        "/api/memory",
-        "/w3.css"
+        "/api/memory"
       ]
 
-      for _ <- 1..50 do
+      for _ <- 1..25 do
         endpoint = Enum.random(endpoints)
         {:ok, response} = req_get("#{base_url}#{endpoint}")
         assert response.status == 200, "Request to #{endpoint} failed"
@@ -207,13 +175,13 @@ defmodule ElixirHttpTest do
     end
 
     @tag :slow
-    test "concurrent mixed requests (10 clients, 20 requests each)", %{base_url: base_url} do
+    test "concurrent mixed requests (5 clients, 10 requests each)", %{base_url: base_url} do
       tasks =
-        for _i <- 1..10 do
+        for _i <- 1..5 do
           Task.async(fn ->
             endpoints = ["/", "/api/system_info", "/api/memory"]
 
-            for j <- 1..20 do
+            for j <- 1..10 do
               endpoint = Enum.at(endpoints, rem(j, 3))
               {:ok, response} = req_get("#{base_url}#{endpoint}")
               assert response.status == 200

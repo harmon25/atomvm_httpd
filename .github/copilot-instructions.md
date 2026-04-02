@@ -94,3 +94,4 @@ Tests use ExUnit. See `test/httpd_integration_test.exs` for socket-level testing
 | `include/*.hrl` | Header files - HTTP codes, trace macros |
 | `priv/` | Static assets (served via `httpd_file_handler`) |
 | `test/support/` | Test-only modules |
+| `erlang_example` | Erlang example implementation |

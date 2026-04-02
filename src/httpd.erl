@@ -286,27 +286,27 @@ call_http_req_handler(Socket, HttpRequest, State) ->
             {noreply, NewState};
         %% reply
         {reply, Reply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {reply, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply), NewState};
+            _ = NewHandlerState,
+            {reply, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply), State};
         {reply, ReplyHeaders, Reply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {reply, create_reply(?OK, ReplyHeaders, Reply), NewState};
+            _ = NewHandlerState,
+            {reply, create_reply(?OK, ReplyHeaders, Reply), State};
         %% close
         close ->
             {close, State};
         {close, Reply} ->
-            {close, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply)};
+            {close, create_close_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply)};
         {close, ReplyHeaders, Reply} ->
-            {close, create_reply(?OK, ReplyHeaders, Reply)};
+            {close, create_close_reply(?OK, ReplyHeaders, Reply)};
         %% errors
         {error, not_found} ->
-            {close, create_error(?NOT_FOUND, not_found)};
+            {close, create_close_reply(?NOT_FOUND, "text/html", error_body(?NOT_FOUND, not_found))};
         {error, bad_request} ->
-            {close, create_error(?BAD_REQUEST, bad_request)};
+            {close, create_close_reply(?BAD_REQUEST, "text/html", error_body(?BAD_REQUEST, bad_request))};
         {error, internal_server_error} ->
-            {close, create_error(?INTERNAL_SERVER_ERROR, internal_server_error)};
+            {close, create_close_reply(?INTERNAL_SERVER_ERROR, "text/html", error_body(?INTERNAL_SERVER_ERROR, internal_server_error))};
         HandlerError ->
-            {close, create_error(?INTERNAL_SERVER_ERROR, HandlerError)}
+            {close, create_close_reply(?INTERNAL_SERVER_ERROR, "text/html", error_body(?INTERNAL_SERVER_ERROR, HandlerError))}
     end.
 
 %% @private
@@ -574,6 +574,19 @@ create_error(StatusCode, Error) ->
     ErrorString = io_lib:format("Error: ~p", [Error]),
     io:format("error in httpd. StatusCode=~p  Error=~p~n", [StatusCode, Error]),
     create_reply(StatusCode, "text/html", ErrorString).
+
+%% @private
+error_body(StatusCode, Error) ->
+    io:format("error in httpd. StatusCode=~p  Error=~p~n", [StatusCode, Error]),
+    io_lib:format("Error: ~p", [Error]).
+
+%% @private
+create_close_reply(StatusCode, ContentType, Reply) when is_list(ContentType) orelse is_binary(ContentType) ->
+    create_close_reply(StatusCode, #{"Content-Type" => ContentType}, Reply);
+create_close_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
+    %% Add Connection: close header to signal the client we're closing
+    HeadersWithClose = Headers#{"Connection" => "close"},
+    create_reply(StatusCode, HeadersWithClose, Reply).
 
 %% @private
 create_reply(StatusCode, ContentType, Reply) when is_list(ContentType) orelse is_binary(ContentType) ->

@@ -47,10 +47,31 @@
     addr => any
 }).
 -define(DEFAULT_SOCKET_OPTIONS, #{
-    {socket, reuseaddr} => true
+    {socket, reuseaddr} => true,
+    %% Linger: wait up to 5 seconds for data to be sent before closing
+    {socket, linger} => #{onoff => true, linger => 5}
 }).
 %% Smaller chunks work better with lwIP's limited buffers
--define(MAX_SEND_CHUNK, 1460).  %% TCP MSS - fits in single packet without fragmentation
+%% ESP32 lwIP has small TX buffers - smaller chunks reduce buffer pressure
+-define(MAX_SEND_CHUNK, 1024).
+
+%% Socket send retry delay (ms). In tests we override to avoid slowing the suite.
+%% On embedded platforms, a small delay between chunks helps lwIP drain buffers.
+-define(SEND_RETRY_DELAY_MS, 10).
+
+%% Inter-chunk delay (ms) to allow lwIP to drain TX buffers on ESP32.
+%% Set to 0 for tests on fast host systems.
+-define(INTER_CHUNK_DELAY_MS, 5).
+
+-ifdef(TEST).
+-undef(SEND_RETRY_DELAY_MS).
+-define(SEND_RETRY_DELAY_MS, 0).
+-undef(INTER_CHUNK_DELAY_MS).
+-define(INTER_CHUNK_DELAY_MS, 0).
+
+%% Expose a test seam to validate partial-send handling without needing a real socket.
+-export([try_send_binary_fun/2]).
+-endif.
 
 %%
 %% API
@@ -128,43 +149,31 @@ handle_info({tcp_closed, Socket}, State) ->
     #state{handler=Handler, handler_state=HandlerState} = State,
     NewHandlerState = Handler:handle_tcp_closed(Socket, HandlerState),
     {noreply, State#state{handler_state=NewHandlerState}};
-handle_info({tcp, Socket, Packet}, State) ->
+handle_info({tcp, Socket, Packet, LoopPid}, State) ->
     #state{handler=Handler, handler_state=HandlerState} = State,
     ?TRACE("received packet: len(~p) from ~p", [erlang:byte_size(Packet), socket:peername(Socket)]),
     case Handler:handle_receive(Socket, Packet, HandlerState) of
         {reply, ResponsePacket, ResponseState} ->
             ?TRACE("Sending reply to endpoint ~p", [socket:peername(Socket)]),
-            case try_send(Socket, ResponsePacket) of
-                ok ->
-                    {noreply, State#state{handler_state=ResponseState}};
-                {error, closed} ->
-                    ?TRACE("Connection closed during send, cleaning up", []),
-                    {noreply, State#state{handler_state=ResponseState}};
-                {error, _Reason} ->
-                    try_close(Socket),
-                    {noreply, State#state{handler_state=ResponseState}}
-            end;
+            %% Send response back to loop process for sending
+            LoopPid ! {send, ResponsePacket, keep_open},
+            {noreply, State#state{handler_state=ResponseState}};
         {noreply, ResponseState} ->
             ?TRACE("no reply", []),
+            LoopPid ! continue,
             {noreply, State#state{handler_state=ResponseState}};
         {close, ResponsePacket} ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
-            case try_send(Socket, ResponsePacket) of
-                ok ->
-                    try_close(Socket);
-                {error, closed} ->
-                    ok;  %% Already closed, nothing to do
-                {error, _Reason} ->
-                    try_close(Socket)
-            end,
+            %% Send response back to loop process for sending, then close
+            LoopPid ! {send, ResponsePacket, close},
             {noreply, State};
         close  ->
             ?TRACE("Closing socket ~p", [Socket]),
-            try_close(Socket),
+            LoopPid ! close,
             {noreply, State};
         _SomethingElse ->
             ?TRACE("Unexpected response from handler ~p: ~p", [Handler, _SomethingElse]),
-            try_close(Socket),
+            LoopPid ! close,
             {noreply, State}
     end;
 handle_info(Info, State) ->
@@ -189,12 +198,14 @@ try_send(Socket, Packet) when is_binary(Packet) ->
 try_send(Socket, Byte) when is_integer(Byte) ->
     %% Handles bytes (0-255) in iolists. Unicode must be pre-encoded to UTF-8.
     ?TRACE("Sending byte ~p as ~p", [Byte, <<Byte:8>>]),
-    try_send(Socket, <<Byte:8>>);
+    try_send_binary(Socket, <<Byte:8>>);
 try_send(Socket, List) when is_list(List) ->
     case is_string(List) of
         true ->
-            try_send(Socket, list_to_binary(List));
-        _ ->
+            %% It's a string (list of integers), convert to binary
+            try_send_binary(Socket, list_to_binary(List));
+        false ->
+            %% It's an iolist, send each element
             try_send_iolist(Socket, List)
     end.
 
@@ -211,36 +222,72 @@ try_send_iolist(Socket, [H | T]) ->
 try_send_binary(_Socket, <<>>) ->
     ok;
 try_send_binary(Socket, Packet) when is_binary(Packet) ->
+    try_send_binary_fun(fun(Chunk) -> socket:send(Socket, Chunk) end, Packet).
+
+%% @private
+%% Same send loop but with an injectable send fun for testing.
+%% SendFun must return the same shapes as socket:send/2.
+try_send_binary_fun(_SendFun, <<>>) ->
+    ok;
+try_send_binary_fun(SendFun, Packet) when is_function(SendFun, 1), is_binary(Packet) ->
     TotalSize = byte_size(Packet),
     ChunkSize = erlang:min(TotalSize, ?MAX_SEND_CHUNK),
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
-    case socket:send(Socket, Chunk) of
+    case SendFun(Chunk) of
         ok ->
-            %% Give the scheduler a chance to run and let TCP drain
-            maybe_yield(Rest),
-            try_send_binary(Socket, Rest);
-        {ok, Remaining} ->
-            %% Partial send - combine remaining with rest and retry
-            try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
-        {error, closed} ->
-            %% Only log if we actually had more data to send
-            case byte_size(Rest) of
-                0 -> ok;  %% Sent everything, client just closed after - that's fine
-                _ -> io:format("Connection closed mid-transfer (~p/~p bytes sent)~n", 
-                               [ChunkSize, TotalSize])
+            %% Small delay between chunks to let lwIP drain TX buffer
+            case Rest of
+                <<>> -> ok;
+                _ -> receive after ?INTER_CHUNK_DELAY_MS -> ok end
             end,
+            try_send_binary_fun(SendFun, Rest);
+        {ok, Remaining} when is_binary(Remaining) ->
+            %% Partial send - AtomVM may return the remaining (unsent) bytes as a binary.
+            case try_send_binary_fun(SendFun, Remaining) of
+                ok -> try_send_binary_fun(SendFun, Rest);
+                Error -> Error
+            end;
+        {ok, SentBytes} when is_integer(SentBytes), SentBytes >= 0 ->
+            %% Partial send - some implementations return the count of bytes actually sent.
+            %% Retry sending the unsent tail of this Chunk.
+            case SentBytes of
+                0 ->
+                    %% No progress; treat like wouldblock and retry.
+                    receive after ?SEND_RETRY_DELAY_MS -> ok end,
+                    try_send_binary_fun(SendFun, Packet);
+                _ when SentBytes < byte_size(Chunk) ->
+                    UnsentBytes = byte_size(Chunk) - SentBytes,
+                    <<_Sent:SentBytes/binary, Unsent:UnsentBytes/binary>> = Chunk,
+                    case try_send_binary_fun(SendFun, Unsent) of
+                        ok -> try_send_binary_fun(SendFun, Rest);
+                        Error -> Error
+                    end;
+                _ when SentBytes =:= byte_size(Chunk) ->
+                    try_send_binary_fun(SendFun, Rest);
+                _ ->
+                    io:format("socket:send unexpected partial result: ~p~n", [SentBytes]),
+                    {error, badarg}
+            end;
+        {error, eagain} ->
+            %% Socket buffer full, brief pause and retry
+            receive after ?SEND_RETRY_DELAY_MS -> ok end,
+            try_send_binary_fun(SendFun, Packet);
+        {error, ewouldblock} ->
+            receive after ?SEND_RETRY_DELAY_MS -> ok end,
+            try_send_binary_fun(SendFun, Packet);
+        {error, timeout} ->
+            receive after ?SEND_RETRY_DELAY_MS -> ok end,
+            try_send_binary_fun(SendFun, Packet);
+        {error, closed} ->
+            io:format("socket:send error: closed~n"),
             {error, closed};
+        {error, ebadf} ->
+            io:format("socket:send error: ebadf~n"),
+            {error, ebadf};
         {error, Reason} ->
-            io:format("Send error: ~p (chunk: ~p, total: ~p)~n", 
-                      [Reason, ChunkSize, TotalSize]),
+            io:format("socket:send error: ~p~n", [Reason]),
             {error, Reason}
     end.
-
-%% Lightweight yield using receive timeout - works in AtomVM
-maybe_yield(<<>>) ->
-    ok;
-maybe_yield(_) ->
-    receive after 0 -> ok end.
 
 is_string([]) ->
     true;
@@ -257,6 +304,16 @@ try_close(Socket) ->
         Error ->
             io:format("Close failed due to error ~p~n", [Error])
     end.
+
+%% @private
+graceful_close(ControllingProcess, Socket) ->
+    %% Shutdown write side to signal we're done sending, then close.
+    %% Give lwIP a moment to flush final data before closing.
+    _ = socket:shutdown(Socket, write),
+    receive after 10 -> ok end,
+    try_close(Socket),
+    ControllingProcess ! {tcp_closed, Socket},
+    ok.
 
 %% @private
 set_socket_options(Socket, SocketOptions) ->
@@ -289,13 +346,32 @@ loop(ControllingProcess, Connection) ->
     case socket:recv(Connection) of
         {ok, Data} ->
             ?TRACE("Received data ~p on connection ~p", [Data, Connection]),
-            ControllingProcess ! {tcp, Connection, Data},
-            loop(ControllingProcess, Connection);
+            ControllingProcess ! {tcp, Connection, Data, self()},
+            %% Wait for response from gen_server
+            receive
+                {send, ResponsePacket, Action} ->
+                    case try_send(Connection, ResponsePacket) of
+                        ok ->
+                            case Action of
+                                keep_open -> loop(ControllingProcess, Connection);
+                                close -> graceful_close(ControllingProcess, Connection)
+                            end;
+                        {error, _} ->
+                            try_close(Connection),
+                            ControllingProcess ! {tcp_closed, Connection}
+                    end;
+                continue ->
+                    loop(ControllingProcess, Connection);
+                close ->
+                    try_close(Connection),
+                    ControllingProcess ! {tcp_closed, Connection}
+            end;
         {error, closed} ->
-            ?TRACE("Peer closed connection ~p", [Connection]),
+            try_close(Connection),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
-        {error, _SomethingElse} ->
-            ?TRACE("Some other error occurred ~p: ~p", [Connection, _SomethingElse]),
-            try_close(Connection)
+        {error, _Reason} ->
+            try_close(Connection),
+            ControllingProcess ! {tcp_closed, Connection},
+            ok
     end.

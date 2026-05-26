@@ -31,64 +31,69 @@
 handle_api_request(get, [Application, Param | Rest], _HttpRequest, _Args) ->
     ?TRACE("Application: ~p Param: ~p, Rest: ~p", [Application, Param, Rest]),
 
-    ApplicationAtom = bin_to_atom(Application),
-    ParamAtom = bin_to_atom(Param),
-    Result = case avm_application:get_env(ApplicationAtom, ParamAtom) of
-        undefined ->
-            undefined;
-        {ok, Value} ->
-            find_value_in_path(Value, Rest)
-        end,
-    case Result of
-        undefined ->
-            {error, not_found};
-        _ ->
-            {ok, Result}
+    case to_existing_atoms(Application, Param) of
+        {ok, ApplicationAtom, ParamAtom} ->
+            Result = case avm_application:get_env(ApplicationAtom, ParamAtom) of
+                undefined ->
+                    undefined;
+                {ok, Value} ->
+                    find_value_in_path(Value, Rest)
+                end,
+            case Result of
+                undefined ->
+                    {error, not_found};
+                _ ->
+                    {ok, Result}
+            end;
+        error ->
+            {error, not_found}
     end;
 
 handle_api_request(post, [Application, Param | Rest], HttpRequest, _Args) ->
     ?TRACE("Application: ~p Param: ~p, Rest: ~p", [Application, Param, Rest]),
 
-    QueryParams = maps:get(query_params, HttpRequest, #{}),
-    ?TRACE("QueryParams: ~p", [QueryParams]),
+    case to_existing_atoms(Application, Param) of
+        {ok, ApplicationAtom, ParamAtom} ->
+            QueryParams = maps:get(query_params, HttpRequest, #{}),
+            ?TRACE("QueryParams: ~p", [QueryParams]),
 
-    ApplicationAtom = bin_to_atom(Application),
-    ParamAtom = bin_to_atom(Param),
+            NewValue = create_value(Rest, QueryParams, #{}),
+            ?TRACE("NewValue: ~p", [NewValue]),
+            MergedValue = case avm_application:get_env(ApplicationAtom, ParamAtom) of
+                undefined ->
+                    NewValue;
+                {ok, OldValue} ->
+                    ?TRACE("merging OldValue: ~p NewValue: ~p", [OldValue, NewValue]),
+                    map_utils:deep_maps_merge(OldValue, NewValue)
+                end,
 
-    NewValue = create_value(Rest, QueryParams, #{}),
-    ?TRACE("NewValue: ~p", [NewValue]),
-    MergedValue = case avm_application:get_env(ApplicationAtom, ParamAtom) of
-        undefined ->
-            NewValue;
-        {ok, OldValue} ->
-            ?TRACE("merging OldValue: ~p NewValue: ~p", [OldValue, NewValue]),
-            map_utils:deep_maps_merge(OldValue, NewValue)
-        end,
-
-    ?TRACE("QueryParams: ~p MergedValue: ~p", [QueryParams, MergedValue]),
-    ok = avm_application:set_env(ApplicationAtom, ParamAtom, MergedValue, [{persistent, true}]);
+            ?TRACE("QueryParams: ~p MergedValue: ~p", [QueryParams, MergedValue]),
+            ok = avm_application:set_env(ApplicationAtom, ParamAtom, MergedValue, [{persistent, true}]);
+        error ->
+            {error, not_found}
+    end;
 
 handle_api_request(delete, [Application, Param | Rest], _HttpRequest, _Args) ->
     ?TRACE("Application: ~p Param: ~p, Rest: ~p", [Application, Param, Rest]),
 
-    ApplicationAtom = bin_to_atom(Application),
-    ParamAtom = bin_to_atom(Param),
-    Result = case avm_application:get_env(ApplicationAtom, ParamAtom) of
-        undefined ->
-            undefined;
-        {ok, Env} ->
-            %% TODO memory leak
-            Path = [bin_to_atom(P) || P <- Rest],
-            ?TRACE("Removing path ~p from env ~p", [Path, Env]),
-            map_utils:remove_entry_in_path(Env, Path)
-        end,
-    case Result of
-        undefined ->
-            {error, not_found};
-        NewEnv ->
-            ?TRACE("NewEnv: ~p", [NewEnv]),
-            avm_application:set_env(ApplicationAtom, ParamAtom, NewEnv),
-            ok
+    case to_existing_atoms(Application, Param) of
+        {ok, ApplicationAtom, ParamAtom} ->
+            Result = case avm_application:get_env(ApplicationAtom, ParamAtom) of
+                undefined ->
+                    undefined;
+                {ok, Env} ->
+                    map_utils:remove_entry_in_path(Env, [binary_to_list(P) || P <- Rest])
+                end,
+            case Result of
+                undefined ->
+                    {error, not_found};
+                NewEnv ->
+                    ?TRACE("NewEnv: ~p", [NewEnv]),
+                    avm_application:set_env(ApplicationAtom, ParamAtom, NewEnv),
+                    ok
+            end;
+        error ->
+            {error, not_found}
     end;
 
 handle_api_request(Method, Path, _HttpRequest, _Args) ->
@@ -98,21 +103,37 @@ handle_api_request(Method, Path, _HttpRequest, _Args) ->
 find_value_in_path(Map, []) ->
     Map;
 find_value_in_path(Value, [H | T]) when is_map(Value) ->
-    %% TODO binary to atom here is bad
-    case maps:get(bin_to_atom(H), Value, undefined) of
+    case maps:get(H, Value, undefined) of
         undefined ->
-            undefined;
+            case to_existing_atom(H) of
+                {ok, Atom} -> find_value_in_path(maps:get(Atom, Value, undefined), T);
+                error -> undefined
+            end;
         V ->
             find_value_in_path(V, T)
     end;
 find_value_in_path(_Value, _Path) ->
     undefined.
 
-bin_to_atom(Bin) ->
-    list_to_atom(binary_to_list(Bin)).
-
 create_value([], QueryParams, Accum) ->
     maps:merge(Accum, QueryParams);
 create_value([H | T], QueryParams, Accum) ->
-    %% TODO binary to atom here is bad
-    #{bin_to_atom(H) => create_value(T, QueryParams, Accum)}.
+    #{H => create_value(T, QueryParams, Accum)}.
+
+to_existing_atoms(A, B) ->
+    case to_existing_atom(A) of
+        {ok, AtomA} ->
+            case to_existing_atom(B) of
+                {ok, AtomB} -> {ok, AtomA, AtomB};
+                error -> error
+            end;
+        error ->
+            error
+    end.
+
+to_existing_atom(Bin) ->
+    try list_to_existing_atom(binary_to_list(Bin)) of
+        Atom -> {ok, Atom}
+    catch
+        error:badarg -> error
+    end.

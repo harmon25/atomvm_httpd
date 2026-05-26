@@ -38,7 +38,7 @@ defmodule HttpdIntegrationTest do
 
     try do
       request_chunks = [
-        "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\n\r\nhe",
+        "POST / HTTP/1.1\r\nHost: example.com\r\ncontent-length: 11\r\n\r\nhe",
         "llo=",
         "world"
       ]
@@ -69,7 +69,7 @@ defmodule HttpdIntegrationTest do
 
       assert_receive {:http_request, request}, @receive_timeout
       headers = Map.fetch!(request, :headers)
-      assert <<"value123">> = Map.fetch!(headers, <<"X-Custom-Header">>)
+      assert <<"value123">> = Map.fetch!(headers, <<"x-custom-header">>)
 
       assert {:ok, response} = :gen_tcp.recv(socket, 0, @receive_timeout)
       assert response =~ "HTTP/1.1 200 OK"
@@ -114,7 +114,7 @@ defmodule HttpdIntegrationTest do
       [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
 
       assert String.contains?(headers, "HTTP/1.1 200 OK")
-      assert String.contains?(headers, "Content-Length: " <> @large_iolist_len)
+      assert String.contains?(headers, "content-length: " <> @large_iolist_len)
       assert byte_size(body) == :erlang.iolist_size(@large_iolist)
     after
       :gen_tcp.close(socket)
@@ -140,8 +140,8 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -169,8 +169,8 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -198,8 +198,8 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -227,8 +227,8 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -256,8 +256,8 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -285,8 +285,8 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length

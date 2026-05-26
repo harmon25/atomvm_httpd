@@ -43,7 +43,8 @@
     query_params := query_params(),
     headers := #{binary() := binary()},
     body := binary(),
-    socket := term()
+    socket := term(),
+    version := binary()
 }.
 -type handler_config() :: #{
     module := module(),
@@ -70,7 +71,9 @@
     config,
     pending_request_map = #{},
     ws_socket_map = #{},
-    pending_buffer_map = #{}
+    pending_buffer_map = #{},
+    pending_timer_map = #{},
+    request_timeout = 30000
 }).
 
 %%
@@ -143,7 +146,7 @@ handle_http_request(Socket, Packet, State) ->
             case maybe_parse_http_request(AccumulatedPacket) of
                 {more, IncompletePacket} ->
                     NewBufferMap = BufferMap#{Socket => IncompletePacket},
-                    {noreply, State#state{pending_buffer_map = NewBufferMap}};
+                    {noreply, start_request_timer(Socket, State#state{pending_buffer_map = NewBufferMap})};
                 {ok, HttpRequest} ->
                     CleanBufferMap = maps:remove(Socket, BufferMap),
                     CleanState = State#state{pending_buffer_map = CleanBufferMap},
@@ -152,7 +155,11 @@ handle_http_request(Socket, Packet, State) ->
                         method := Method,
                         headers := Headers
                     } = HttpRequest,
-                    case get_protocol(Method, Headers) of
+                    case Method of
+                        undefined ->
+                            {close, create_error(?NOT_ALLOWED, method_not_allowed)};
+                        _ ->
+                            case get_protocol(Method, Headers) of
                         http ->
                             case init_handler(HttpRequest, CleanState) of
                                 {ok, {Handler, HandlerState, PathSuffix, HandlerConfig}} ->
@@ -169,30 +176,37 @@ handle_http_request(Socket, Packet, State) ->
                             end;
                         ws ->
                             ?TRACE("Protocol is ws", []),
-                            Config = CleanState#state.config,
-                            Path = maps:get(path, HttpRequest),
-                            case get_handler(Path, Config) of
-                                {ok, PathSuffix, EntryConfig} ->
-                                    WsHandler = maps:get(handler, EntryConfig),
-                                    ?TRACE("Got handler ~p", [WsHandler]),
-                                    HandlerConfig = maps:get(handler_config, EntryConfig, #{}),
-                                    case WsHandler:start(Socket, PathSuffix, HandlerConfig) of
-                                        {ok, WebSocket} ->
-                                            ?TRACE("Started web socket handler: ~p", [WebSocket]),
-                                            NewWebSocketMap = maps:put(Socket, WebSocket, CleanState#state.ws_socket_map),
-                                            NewState = CleanState#state{ws_socket_map = NewWebSocketMap},
-                                            ReplyToken = get_reply_token(maps:get(headers, HttpRequest)),
-                                            ReplyHeaders = #{"Upgrade" => "websocket", "Connection" => "Upgrade", "Sec-WebSocket-Accept" => ReplyToken},
-                                            Reply = create_reply(?SWITCHING_PROTOCOLS, ReplyHeaders, <<"">>),
-                                            ?TRACE("Sending web socket upgrade reply: ~p", [Reply]),
-                                            {reply, Reply, NewState};
+                            Headers = maps:get(headers, HttpRequest, #{}),
+                            case get_ws_key(Headers) of
+                                {ok, WebSocketKey} ->
+                                    ReplyToken = get_reply_token(WebSocketKey),
+                                    Config = CleanState#state.config,
+                                    Path = maps:get(path, HttpRequest),
+                                    case get_handler(Path, Config) of
+                                        {ok, PathSuffix, EntryConfig} ->
+                                            WsHandler = maps:get(handler, EntryConfig),
+                                            ?TRACE("Got handler ~p", [WsHandler]),
+                                            HandlerConfig = maps:get(handler_config, EntryConfig, #{}),
+                                            case WsHandler:start(Socket, PathSuffix, HandlerConfig) of
+                                                {ok, WebSocket} ->
+                                                    ?TRACE("Started web socket handler: ~p", [WebSocket]),
+                                                    NewWebSocketMap = maps:put(Socket, WebSocket, CleanState#state.ws_socket_map),
+                                                    NewState = CleanState#state{ws_socket_map = NewWebSocketMap},
+                                                    ReplyHeaders = #{"Upgrade" => "websocket", "Connection" => "Upgrade", "Sec-WebSocket-Accept" => ReplyToken},
+                                                    Reply = create_reply(?SWITCHING_PROTOCOLS, ReplyHeaders, <<"">>),
+                                                    ?TRACE("Sending web socket upgrade reply: ~p", [Reply]),
+                                                    {reply, Reply, NewState};
+                                                Error ->
+                                                    ?TRACE("Web socket error: ~p", [Error]),
+                                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                                            end;
                                         Error ->
-                                            ?TRACE("Web socket error: ~p", [Error]),
                                             {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
                                     end;
-                                Error ->
-                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                                error ->
+                                    {close, create_error(?BAD_REQUEST, missing_websocket_key)}
                             end
+                    end
                     end;
                 {error, Reason} ->
                     {close, create_error(?BAD_REQUEST, Reason)}
@@ -232,28 +246,29 @@ handle_request_state(Socket, HttpRequest, State) ->
         complete ->
             ?TRACE("Request complete.  Handling...", []),
             NewPendingRequestMap = maps:remove(Socket, PendingRequestMap),
-            call_http_req_handler(Socket, HttpRequest, State#state{pending_request_map = NewPendingRequestMap});
+            CleanState = stop_request_timer(Socket, State#state{pending_request_map = NewPendingRequestMap}),
+            call_http_req_handler(Socket, HttpRequest, CleanState);
         expect_continue ->
             Headers = maps:get(headers, HttpRequest),
-            NewHeaders = maps:remove(<<"Expect">>, Headers),
+            NewHeaders = maps:remove(<<"expect">>, Headers),
             NewHttpRequest = HttpRequest#{headers := NewHeaders},
             Reply = create_reply(?CONTINUE, #{}, <<"">>),
             NewPendingRequestMap = PendingRequestMap#{Socket => NewHttpRequest},
-            {reply, Reply, State#state{pending_request_map = NewPendingRequestMap}};
+            {reply, Reply, start_request_timer(Socket, State#state{pending_request_map = NewPendingRequestMap})};
         wait_for_body ->
             NewPendingRequestMap = PendingRequestMap#{Socket => HttpRequest},
-            {noreply, State#state{pending_request_map = NewPendingRequestMap}}
+            {noreply, start_request_timer(Socket, State#state{pending_request_map = NewPendingRequestMap})}
     end.
 
 %% @private
 get_request_state(HttpRequest) ->
     Headers = maps:get(headers, HttpRequest),
-    case maps:get(<<"Expect">>, Headers, undefined) of
+    case maps:get(<<"expect">>, Headers, undefined) of
         <<"100-continue">> ->
             ?TRACE("Expect: 100-continue", []),
             expect_continue;
         undefined ->
-            case maps:get(<<"Content-Length">>, Headers, undefined) of
+            case maps:get(<<"content-length">>, Headers, undefined) of
                 undefined ->
                     ?TRACE("No content length; request complete", []),
                     complete;
@@ -279,6 +294,7 @@ call_http_req_handler(Socket, HttpRequest, State) ->
         handler := Handler,
         handler_state := HandlerState
     } = HttpRequest,
+    KeepAlive = is_keep_alive(HttpRequest),
     case Handler:handle_http_req(HttpRequest, HandlerState) of
         %% noreply
         {noreply, NewHandlerState} ->
@@ -293,11 +309,22 @@ call_http_req_handler(Socket, HttpRequest, State) ->
             {reply, create_reply(?OK, ReplyHeaders, Reply), NewState};
         %% close
         close ->
-            {close, State};
+            case KeepAlive of
+                true -> {reply, create_reply(?OK, #{"Content-Type" => "text/plain"}, <<"">>), State};
+                false -> {close, State}
+            end;
         {close, Reply} ->
-            {close, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply)};
+            ReplyPacket = create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply),
+            case KeepAlive of
+                true -> {reply, ReplyPacket, State};
+                false -> {close, ReplyPacket}
+            end;
         {close, ReplyHeaders, Reply} ->
-            {close, create_reply(?OK, ReplyHeaders, Reply)};
+            ReplyPacket = create_reply(?OK, ReplyHeaders, Reply),
+            case KeepAlive of
+                true -> {reply, ReplyPacket, State};
+                false -> {close, ReplyPacket}
+            end;
         %% errors
         {error, not_found} ->
             {close, create_error(?NOT_FOUND, not_found)};
@@ -308,6 +335,11 @@ call_http_req_handler(Socket, HttpRequest, State) ->
         HandlerError ->
             {close, create_error(?INTERNAL_SERVER_ERROR, HandlerError)}
     end.
+
+%% @private
+is_keep_alive(HttpRequest) ->
+    Headers = maps:get(headers, HttpRequest, #{}),
+    maps:get(<<"connection">>, Headers, undefined) =:= <<"keep-alive">>.
 
 %% @private
 update_state(Socket, HttpRequest, HandlerState, State) ->
@@ -321,9 +353,11 @@ update_state(Socket, HttpRequest, HandlerState, State) ->
 handle_tcp_closed(Socket, State) ->
     NewPendingRequestMap = maps:remove(Socket, State#state.pending_request_map),
     NewPendingBufferMap = maps:remove(Socket, State#state.pending_buffer_map),
+    NewTimerMap = maps:remove(Socket, State#state.pending_timer_map),
     CleanState = State#state{
         pending_request_map = NewPendingRequestMap,
-        pending_buffer_map = NewPendingBufferMap
+        pending_buffer_map = NewPendingBufferMap,
+        pending_timer_map = NewTimerMap
     },
     case maps:get(Socket, CleanState#state.ws_socket_map, undefined) of
         undefined ->
@@ -339,8 +373,13 @@ handle_tcp_closed(Socket, State) ->
 %%
 
 %% @private
-get_reply_token(Headers) ->
-    #{<<"Sec-WebSocket-Key">> := WebSocketKey} = Headers,
+get_ws_key(#{<<"sec-websocket-key">> := Key}) ->
+    {ok, Key};
+get_ws_key(_) ->
+    error.
+
+%% @private
+get_reply_token(WebSocketKey) ->
     MagicKey = <<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>,
     PreImage = <<WebSocketKey/binary, MagicKey/binary>>,
     ReplyToken = base64:encode(crypto:hash(sha, PreImage)),
@@ -348,14 +387,14 @@ get_reply_token(Headers) ->
     ReplyToken.
 
 %% @private
-parse_http_request(Packet) ->
-    {Heading, HeadingRest} = parse_heading(Packet, start, [], #{}),
-    {Headers, Body} = parse_header(HeadingRest, #{}),
+parse_http_request(HeadingList, Body) ->
+    {Heading, _HeadingRest} = parse_heading(HeadingList, start, [], #{}),
+    {Headers, _} = parse_header(_HeadingRest, #{}),
     maps:merge(
         Heading,
         #{
             headers => Headers,
-            body => erlang:list_to_binary(Body)
+            body => Body
         }
     ).
 
@@ -363,9 +402,11 @@ maybe_parse_http_request(Packet) when is_binary(Packet) ->
     case find_header_delimiter(Packet) of
         nomatch ->
             {more, Packet};
-        {_Pos, _Len} ->
+        {Pos, Len} ->
             try
-                {ok, parse_http_request(binary_to_list(Packet))}
+                HeaderEnd = Pos + Len,
+                <<HeadingPart:HeaderEnd/binary, Body/binary>> = Packet,
+                {ok, parse_http_request(binary_to_list(HeadingPart), Body)}
             catch
                 throw:Reason ->
                     {error, Reason};
@@ -410,8 +451,13 @@ parse_heading([$\s|Rest], wait_version, Tmp, Accum) ->
 parse_heading(Packet, wait_version, Tmp, Accum) ->
     parse_heading(Packet, in_version, Tmp, Accum);
 %% in_version state
-parse_heading([$\n|Rest], in_version, _Tmp, Accum) ->
-    {Accum, Rest};
+parse_heading([$\n|Rest], in_version, Tmp, Accum) ->
+    RawVersion = lists:reverse(Tmp),
+    Version = case RawVersion of
+        [$\r | Clean] -> list_to_binary(Clean);
+        _ -> list_to_binary(RawVersion)
+    end,
+    {Accum#{version => Version}, Rest};
 parse_heading([C|Rest], in_version, Tmp, Accum) ->
     parse_heading(Rest, in_version, [C|Tmp], Accum);
 %% error state
@@ -439,9 +485,12 @@ parse_line(_Packet, _Accum) ->
 
 %% @private
 split_header(Header) ->
-    [Key, Value] = string:split(Header, ":"),
-    %% TODO to_lower the key
-    {list_to_binary(string:trim(Key)), list_to_binary(string:trim(Value))}.
+    case string:split(Header, ":") of
+        [Key, Value] ->
+            {list_to_binary(string:to_lower(string:trim(Key))), list_to_binary(string:trim(Value))};
+        _ ->
+            throw(bad_header)
+    end.
 
 normalize_uri(Uri) ->
     case string:split(Uri, "?", leading) of
@@ -458,8 +507,15 @@ tokenize_path(Path) ->
 %% @private
 parse_query_params(QueryParamString) ->
     NVPairsStrings = string:split(QueryParamString, "&", all),
-    NVPairLists = [string:split(NVPairString, "=") || NVPairString <- NVPairsStrings],
-    maps:from_list([{list_to_atom(Key), url_decode(Value, [])} || [Key, Value] <- NVPairLists]).
+    maps:from_list([parse_query_param(NVPairString) || NVPairString <- NVPairsStrings]).
+
+parse_query_param(NVPairString) ->
+    case string:split(NVPairString, "=") of
+        [Key] ->
+            {list_to_binary(Key), <<"">>};
+        [Key, Value] ->
+            {list_to_binary(Key), url_decode(Value, [])}
+    end.
 
 % from https://docs.microfocus.com/OMi/10.62/Content/OMi/ExtGuide/ExtApps/URL_encoding.htm
 url_decode([], Accum) ->
@@ -558,7 +614,7 @@ starts_with([_H1|_], [_H2|_]) ->
 
 
 %% @private
-get_protocol(get, #{<<"Upgrade">> := <<"websocket">>, <<"Connection">> := Upgrade, <<"Sec-WebSocket-Key">> := _, <<"Sec-WebSocket-Version">> := <<"13">>} = _Headers) ->
+get_protocol(get, #{<<"upgrade">> := <<"websocket">>, <<"connection">> := Upgrade, <<"sec-websocket-key">> := _, <<"sec-websocket-version">> := <<"13">>} = _Headers) ->
     case str(string:to_upper(binary_to_list(Upgrade)), "UPGRADE") of
         0 ->
             http;
@@ -593,18 +649,8 @@ create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
 %% @private
 ensure_content_length(Headers, ReplyLen) ->
     LenBin = erlang:integer_to_binary(ReplyLen),
-    CleanHeaders = remove_content_length_header(Headers),
-    CleanHeaders#{<<"Content-Length">> => LenBin}.
-
-%% @private
-remove_content_length_header(Headers) ->
-    KeysToRemove = [
-        "Content-Length",
-        <<"Content-Length">>,
-        "content-length",
-        <<"content-length">>
-    ],
-    lists:foldl(fun(Key, Acc) -> maps:remove(Key, Acc) end, Headers, KeysToRemove).
+    CleanHeaders = maps:remove(<<"content-length">>, Headers),
+    CleanHeaders#{<<"content-length">> => LenBin}.
 
 %% @private
 maybe_binary_to_string(Bin) when is_binary(Bin) ->
@@ -640,6 +686,8 @@ moniker(?BAD_REQUEST) ->
     <<"BAD_REQUEST">>;
 moniker(?NOT_FOUND) ->
     <<"NOT_FOUND">>;
+moniker(?NOT_ALLOWED) ->
+    <<"METHOD_NOT_ALLOWED">>;
 moniker(?CONTINUE) ->
     <<"Continue">>;
 moniker(?SWITCHING_PROTOCOLS) ->
@@ -658,3 +706,15 @@ method_to_atom("DELETE") ->
     delete;
 method_to_atom(_) ->
     undefined.
+
+%% @private
+start_request_timer(Socket, State) ->
+    Timeout = State#state.request_timeout,
+    TimerRef = erlang:send_after(Timeout, self(), {request_timeout, Socket}),
+    TimerMap = State#state.pending_timer_map,
+    State#state{pending_timer_map = TimerMap#{Socket => TimerRef}}.
+
+%% @private
+stop_request_timer(Socket, State) ->
+    NewTimerMap = maps:remove(Socket, State#state.pending_timer_map),
+    State#state{pending_timer_map = NewTimerMap}.

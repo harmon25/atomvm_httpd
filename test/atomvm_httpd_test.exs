@@ -13,7 +13,7 @@ defmodule HttpdUnitTest do
     assert :post = Map.fetch!(http_request, :method)
 
     headers = Map.fetch!(http_request, :headers)
-    assert <<"11">> = Map.fetch!(headers, <<"Content-Length">>)
+    assert <<"11">> = Map.fetch!(headers, <<"content-length">>)
     assert <<"hello=world">> = Map.fetch!(http_request, :body)
   end
 
@@ -23,15 +23,15 @@ defmodule HttpdUnitTest do
 
     assert {:ok, http_request} = :httpd.maybe_parse_http_request(request)
     headers = Map.fetch!(http_request, :headers)
-    assert <<"value200">> = Map.fetch!(headers, <<"X-Test-200">>)
+    assert <<"value200">> = Map.fetch!(headers, <<"x-test-200">>)
   end
 
   test "handle_request_state stores partial body until complete" do
     socket = make_ref()
-    http_request = %{headers: %{<<"Content-Length">> => <<"5">>}, body: <<"12">>}
-    state = {:state, [], %{}, %{}, %{}}
+    http_request = %{headers: %{<<"content-length">> => <<"5">>}, body: <<"12">>}
+    state = {:state, [], %{}, %{}, %{}, %{}, 30000}
 
-    assert {:noreply, {:state, [], %{^socket => ^http_request}, %{}, %{}}} =
+    assert {:noreply, {:state, [], %{^socket => ^http_request}, %{}, %{}, %{}, 30000}} =
              :httpd.handle_request_state(socket, http_request, state)
 
     assert :wait_for_body = :httpd.get_request_state(http_request)

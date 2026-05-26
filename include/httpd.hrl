@@ -18,6 +18,7 @@
 -define(INTERNAL_SERVER_ERROR, 500).
 -define(BAD_REQUEST, 400).
 -define(NOT_FOUND, 404).
+-define(NOT_ALLOWED, 405).
 -define(OK, 200).
 -define(CONTINUE, 100).
 -define(SWITCHING_PROTOCOLS, 101).

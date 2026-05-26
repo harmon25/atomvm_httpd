@@ -32,14 +32,16 @@
 -callback handle_receive(Socket :: term(), Packet :: binary(), State :: term()) ->
     {reply, Packet :: iolist(), NewState :: term()} | {noreply, NewState :: term()} | {close, Packet :: iolist()} | close.
 
--callback handle_tcp_closed(Socket :: term(), State :: term()) -> ok.
+-callback handle_tcp_closed(Socket :: term(), State :: term()) -> NewState :: term().
 
 % -define(TRACE_ENABLED, true).
 -include_lib("atomvm_httpd/include/trace.hrl").
 
 -record(state, {
     handler,
-    handler_state
+    handler_state,
+    connections = #{},
+    max_connections = 0
 }).
 
 -define(DEFAULT_BIND_OPTIONS, #{
@@ -78,6 +80,7 @@ stop(Server) ->
 %% @hidden
 init({BindOptions, SocketOptions, Handler, Args}) ->
     Self = self(),
+    MaxConnections = maps:get(max_connections, SocketOptions, 0),
     case socket:open(inet, stream, tcp) of
         {ok, Socket} ->
             ok = set_socket_options(Socket, SocketOptions),
@@ -85,10 +88,10 @@ init({BindOptions, SocketOptions, Handler, Args}) ->
                 ok ->
                     case socket:listen(Socket) of
                         ok ->
-                            spawn(fun() -> accept(Self, Socket) end),
+                            spawn_link(fun() -> accept(Self, Socket) end),
                             case Handler:init(Args) of
                                 {ok, HandlerState} ->
-                                    {ok, #state{handler = Handler, handler_state = HandlerState}};
+                                    {ok, #state{handler = Handler, handler_state = HandlerState, max_connections = MaxConnections}};
                                 HandlerError ->
                                     try_close(Socket),
                                     {stop, {handler_error, HandlerError}}
@@ -108,7 +111,7 @@ init({Socket, Handler, Args}) ->
     Self = self(),
     case Handler:init(Args) of
         {ok, HandlerState} ->
-            spawn(fun() -> loop(Self, Socket) end),
+            spawn_link(fun() -> loop(Self, Socket) end),
             {ok, #state{handler = Handler, handler_state = HandlerState}};
         HandlerError ->
             {stop, {handler_error, HandlerError}}
@@ -125,12 +128,43 @@ handle_cast(_Msg, State) ->
 %% @hidden
 handle_info({tcp_closed, Socket}, State) ->
     ?TRACE("TCP Socket closed ~p", [Socket]),
-    #state{handler=Handler, handler_state=HandlerState} = State,
+    #state{handler=Handler, handler_state=HandlerState, connections=Conns} = State,
     NewHandlerState = Handler:handle_tcp_closed(Socket, HandlerState),
-    {noreply, State#state{handler_state=NewHandlerState}};
+    NewConns = maps:remove(Socket, Conns),
+    {noreply, State#state{handler_state=NewHandlerState, connections=NewConns}};
+handle_info({request_timeout, Socket}, State) ->
+    ?TRACE("Request timeout for socket ~p", [Socket]),
+    try_close(Socket),
+    {noreply, State};
 handle_info({tcp, Socket, Packet}, State) ->
-    #state{handler=Handler, handler_state=HandlerState} = State,
+    #state{connections=Conns, max_connections=MaxConns} = State,
     ?TRACE("received packet: len(~p) from ~p", [erlang:byte_size(Packet), socket:peername(Socket)]),
+    case maps:is_key(Socket, Conns) of
+        false when MaxConns > 0, map_size(Conns) >= MaxConns ->
+            ?TRACE("Connection limit reached (~p), closing ~p", [MaxConns, Socket]),
+            try_close(Socket),
+            {noreply, State};
+        _ ->
+            NewConns = case maps:is_key(Socket, Conns) of
+                false -> Conns#{Socket => true};
+                true -> Conns
+            end,
+            handle_tcp_data(Socket, Packet, State#state{connections = NewConns})
+    end;
+handle_info({'EXIT', _Pid, _Reason}, State) ->
+    ?TRACE("Linked process ~p exited: ~p", [_Pid, _Reason]),
+    {noreply, State};
+handle_info(Info, State) ->
+    io:format("Received spurious info msg: ~p~n", [Info]),
+    {noreply, State}.
+
+%% @hidden
+terminate(_Reason, _State) ->
+    ok.
+
+%% @private
+handle_tcp_data(Socket, Packet, State) ->
+    #state{handler=Handler, handler_state=HandlerState} = State,
     case Handler:handle_receive(Socket, Packet, HandlerState) of
         {reply, ResponsePacket, ResponseState} ->
             ?TRACE("Sending reply to endpoint ~p", [socket:peername(Socket)]),
@@ -153,7 +187,7 @@ handle_info({tcp, Socket, Packet}, State) ->
                 ok ->
                     try_close(Socket);
                 {error, closed} ->
-                    ok;  %% Already closed, nothing to do
+                    ok;
                 {error, _Reason} ->
                     try_close(Socket)
             end,
@@ -166,14 +200,7 @@ handle_info({tcp, Socket, Packet}, State) ->
             ?TRACE("Unexpected response from handler ~p: ~p", [Handler, _SomethingElse]),
             try_close(Socket),
             {noreply, State}
-    end;
-handle_info(Info, State) ->
-    io:format("Received spurious info msg: ~p~n", [Info]),
-    {noreply, State}.
-
-%% @hidden
-terminate(_Reason, _State) ->
-    ok.
+    end.
 
 %%
 %% internal functions
@@ -275,7 +302,7 @@ accept(ControllingProcess, ListenSocket) ->
     case socket:accept(ListenSocket) of
         {ok, Connection} ->
             ?TRACE("Accepted connection from ~p", [socket:peername(Connection)]),
-            spawn(fun() -> accept(ControllingProcess, ListenSocket) end),
+            spawn_link(fun() -> accept(ControllingProcess, ListenSocket) end),
             loop(ControllingProcess, Connection);
         _Error ->
             ?TRACE("Error accepting connection: ~p", [_Error]),
@@ -295,6 +322,9 @@ loop(ControllingProcess, Connection) ->
             ?TRACE("Peer closed connection ~p", [Connection]),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
+        {error, timeout} ->
+            ?TRACE("Timeout on recv from ~p, retrying", [Connection]),
+            loop(ControllingProcess, Connection);
         {error, _SomethingElse} ->
             ?TRACE("Some other error occurred ~p: ~p", [Connection, _SomethingElse]),
             try_close(Connection)

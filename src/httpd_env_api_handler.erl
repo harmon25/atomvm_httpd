@@ -82,7 +82,7 @@ handle_api_request(delete, [Application, Param | Rest], _HttpRequest, _Args) ->
                 undefined ->
                     undefined;
                 {ok, Env} ->
-                    map_utils:remove_entry_in_path(Env, [binary_to_list(P) || P <- Rest])
+                    map_utils:remove_entry_in_path(Env, Rest)
                 end,
             case Result of
                 undefined ->

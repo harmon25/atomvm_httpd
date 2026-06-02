@@ -81,9 +81,12 @@ stop(Server) ->
 init({BindOptions, SocketOptions, Handler, Args}) ->
     Self = self(),
     MaxConnections = maps:get(max_connections, SocketOptions, 0),
+    %% Strip max_connections before passing to set_socket_options/2 so that
+    %% socket:setopt/3 is never called with an unknown option key.
+    CleanSocketOptions = maps:remove(max_connections, SocketOptions),
     case socket:open(inet, stream, tcp) of
         {ok, Socket} ->
-            ok = set_socket_options(Socket, SocketOptions),
+            ok = set_socket_options(Socket, CleanSocketOptions),
             case socket:bind(Socket, BindOptions) of
                 ok ->
                     case socket:listen(Socket) of
@@ -126,6 +129,17 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 %% @hidden
+handle_info({new_connection, Socket}, State) ->
+    #state{connections=Conns, max_connections=MaxConns} = State,
+    case MaxConns > 0 andalso map_size(Conns) >= MaxConns of
+        true ->
+            ?TRACE("Connection limit reached (~p), rejecting ~p at accept", [MaxConns, Socket]),
+            try_close(Socket),
+            {noreply, State};
+        false ->
+            ?TRACE("Tracking new connection ~p (~p/~p)", [Socket, map_size(Conns) + 1, MaxConns]),
+            {noreply, State#state{connections = Conns#{Socket => true}}}
+    end;
 handle_info({tcp_closed, Socket}, State) ->
     ?TRACE("TCP Socket closed ~p", [Socket]),
     #state{handler=Handler, handler_state=HandlerState, connections=Conns} = State,
@@ -137,20 +151,8 @@ handle_info({request_timeout, Socket}, State) ->
     try_close(Socket),
     {noreply, State};
 handle_info({tcp, Socket, Packet}, State) ->
-    #state{connections=Conns, max_connections=MaxConns} = State,
     ?TRACE("received packet: len(~p) from ~p", [erlang:byte_size(Packet), socket:peername(Socket)]),
-    case maps:is_key(Socket, Conns) of
-        false when MaxConns > 0, map_size(Conns) >= MaxConns ->
-            ?TRACE("Connection limit reached (~p), closing ~p", [MaxConns, Socket]),
-            try_close(Socket),
-            {noreply, State};
-        _ ->
-            NewConns = case maps:is_key(Socket, Conns) of
-                false -> Conns#{Socket => true};
-                true -> Conns
-            end,
-            handle_tcp_data(Socket, Packet, State#state{connections = NewConns})
-    end;
+    handle_tcp_data(Socket, Packet, State);
 handle_info({'EXIT', _Pid, _Reason}, State) ->
     ?TRACE("Linked process ~p exited: ~p", [_Pid, _Reason]),
     {noreply, State};
@@ -302,6 +304,10 @@ accept(ControllingProcess, ListenSocket) ->
     case socket:accept(ListenSocket) of
         {ok, Connection} ->
             ?TRACE("Accepted connection from ~p", [socket:peername(Connection)]),
+            %% Notify controlling process immediately so max_connections is enforced
+            %% at accept time (before any data arrives).  The controlling process may
+            %% close the socket if the limit is exceeded; loop/2 will detect the close.
+            ControllingProcess ! {new_connection, Connection},
             spawn_link(fun() -> accept(ControllingProcess, ListenSocket) end),
             loop(ControllingProcess, Connection);
         _Error ->

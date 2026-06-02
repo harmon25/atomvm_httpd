@@ -294,37 +294,29 @@ call_http_req_handler(Socket, HttpRequest, State) ->
         handler := Handler,
         handler_state := HandlerState
     } = HttpRequest,
-    KeepAlive = is_keep_alive(HttpRequest),
     case Handler:handle_http_req(HttpRequest, HandlerState) of
         %% noreply
         {noreply, NewHandlerState} ->
             NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
             {noreply, NewState};
-        %% reply
+        %% reply — handler wants to keep the connection open; honour keep-alive if requested
         {reply, Reply, NewHandlerState} ->
             NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
             {reply, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply), NewState};
         {reply, ReplyHeaders, Reply, NewHandlerState} ->
             NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
             {reply, create_reply(?OK, ReplyHeaders, Reply), NewState};
-        %% close
+        %% close — handler explicitly requests connection close; always honour it
+        %% regardless of the client's keep-alive preference, preserving the documented
+        %% httpd_handler contract that {close, ...} means "send response, close connection".
         close ->
-            case KeepAlive of
-                true -> {reply, create_reply(?OK, #{"Content-Type" => "text/plain"}, <<"">>), State};
-                false -> {close, State}
-            end;
+            {close, State};
         {close, Reply} ->
             ReplyPacket = create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply),
-            case KeepAlive of
-                true -> {reply, ReplyPacket, State};
-                false -> {close, ReplyPacket}
-            end;
+            {close, ReplyPacket};
         {close, ReplyHeaders, Reply} ->
             ReplyPacket = create_reply(?OK, ReplyHeaders, Reply),
-            case KeepAlive of
-                true -> {reply, ReplyPacket, State};
-                false -> {close, ReplyPacket}
-            end;
+            {close, ReplyPacket};
         %% errors
         {error, not_found} ->
             {close, create_error(?NOT_FOUND, not_found)};
@@ -337,11 +329,6 @@ call_http_req_handler(Socket, HttpRequest, State) ->
     end.
 
 %% @private
-is_keep_alive(HttpRequest) ->
-    Headers = maps:get(headers, HttpRequest, #{}),
-    maps:get(<<"connection">>, Headers, undefined) =:= <<"keep-alive">>.
-
-%% @private
 update_state(Socket, HttpRequest, HandlerState, State) ->
     NewHttpRequest = HttpRequest#{handler_state := HandlerState},
     PendingRequestMap = State#state.pending_request_map,
@@ -351,13 +338,15 @@ update_state(Socket, HttpRequest, HandlerState, State) ->
 
 %% @hidden
 handle_tcp_closed(Socket, State) ->
-    NewPendingRequestMap = maps:remove(Socket, State#state.pending_request_map),
-    NewPendingBufferMap = maps:remove(Socket, State#state.pending_buffer_map),
-    NewTimerMap = maps:remove(Socket, State#state.pending_timer_map),
-    CleanState = State#state{
+    %% Cancel any pending request timer so it cannot fire after the socket is gone
+    %% and deliver a stale {request_timeout, Socket} message that might accidentally
+    %% close a future connection reusing the same socket term.
+    TimerCancelledState = stop_request_timer(Socket, State),
+    NewPendingRequestMap = maps:remove(Socket, TimerCancelledState#state.pending_request_map),
+    NewPendingBufferMap = maps:remove(Socket, TimerCancelledState#state.pending_buffer_map),
+    CleanState = TimerCancelledState#state{
         pending_request_map = NewPendingRequestMap,
-        pending_buffer_map = NewPendingBufferMap,
-        pending_timer_map = NewTimerMap
+        pending_buffer_map = NewPendingBufferMap
     },
     case maps:get(Socket, CleanState#state.ws_socket_map, undefined) of
         undefined ->
@@ -514,7 +503,9 @@ parse_query_param(NVPairString) ->
         [Key] ->
             {list_to_binary(Key), <<"">>};
         [Key, Value] ->
-            {list_to_binary(Key), url_decode(Value, [])}
+            %% url_decode/2 returns a charlist; convert to binary so all
+            %% query param values are binaries as declared in query_params().
+            {list_to_binary(Key), list_to_binary(url_decode(Value, []))}
     end.
 
 % from https://docs.microfocus.com/OMi/10.62/Content/OMi/ExtGuide/ExtApps/URL_encoding.htm
@@ -710,11 +701,27 @@ method_to_atom(_) ->
 %% @private
 start_request_timer(Socket, State) ->
     Timeout = State#state.request_timeout,
-    TimerRef = erlang:send_after(Timeout, self(), {request_timeout, Socket}),
     TimerMap = State#state.pending_timer_map,
+    %% Cancel any pre-existing timer for this socket to avoid stale timeout
+    %% messages being delivered to a keep-alive connection.
+    case maps:get(Socket, TimerMap, undefined) of
+        undefined -> ok;
+        OldRef ->
+            erlang:cancel_timer(OldRef),
+            %% Flush a stale timeout message that may already be in the mailbox.
+            receive {request_timeout, Socket} -> ok after 0 -> ok end
+    end,
+    TimerRef = erlang:send_after(Timeout, self(), {request_timeout, Socket}),
     State#state{pending_timer_map = TimerMap#{Socket => TimerRef}}.
 
 %% @private
 stop_request_timer(Socket, State) ->
-    NewTimerMap = maps:remove(Socket, State#state.pending_timer_map),
-    State#state{pending_timer_map = NewTimerMap}.
+    TimerMap = State#state.pending_timer_map,
+    %% Cancel the timer so it never fires after the request completes.
+    case maps:get(Socket, TimerMap, undefined) of
+        undefined -> ok;
+        Ref ->
+            erlang:cancel_timer(Ref),
+            receive {request_timeout, Socket} -> ok after 0 -> ok end
+    end,
+    State#state{pending_timer_map = maps:remove(Socket, TimerMap)}.

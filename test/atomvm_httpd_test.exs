@@ -31,8 +31,18 @@ defmodule HttpdUnitTest do
     http_request = %{headers: %{<<"content-length">> => <<"5">>}, body: <<"12">>}
     state = {:state, [], %{}, %{}, %{}, %{}, 30000}
 
-    assert {:noreply, {:state, [], %{^socket => ^http_request}, %{}, %{}, %{}, 30000}} =
-             :httpd.handle_request_state(socket, http_request, state)
+    assert {:noreply, result_state} = :httpd.handle_request_state(socket, http_request, state)
+
+    # Destructure the result state tuple: {state, config, pending_request_map,
+    # ws_socket_map, pending_buffer_map, pending_timer_map, request_timeout}
+    {:state, _config, pending_request_map, _ws, _buf, pending_timer_map, _timeout} = result_state
+
+    # Partial request should be stored in the pending map
+    assert %{^socket => ^http_request} = pending_request_map
+
+    # A request timer should have been started for the socket
+    assert is_reference(Map.get(pending_timer_map, socket)),
+           "expected a timer ref in pending_timer_map for the socket"
 
     assert :wait_for_body = :httpd.get_request_state(http_request)
   end

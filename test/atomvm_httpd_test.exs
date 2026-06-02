@@ -40,9 +40,14 @@ defmodule HttpdUnitTest do
     # Partial request should be stored in the pending map
     assert %{^socket => ^http_request} = pending_request_map
 
-    # A request timer should have been started for the socket
-    assert is_reference(Map.get(pending_timer_map, socket)),
-           "expected a timer ref in pending_timer_map for the socket"
+    # A request timer should have been started for the socket.
+    # The entry is {TimerRef, Tag} — both are opaque references.
+    timer_entry = Map.get(pending_timer_map, socket)
+    assert is_tuple(timer_entry) and tuple_size(timer_entry) == 2,
+           "expected a {timer_ref, tag} tuple in pending_timer_map for the socket"
+    {t_ref, t_tag} = timer_entry
+    assert is_reference(t_ref)
+    assert is_reference(t_tag)
 
     assert :wait_for_body = :httpd.get_request_state(http_request)
   end

@@ -295,6 +295,55 @@ defmodule HttpdIntegrationTest do
     end
   end
 
+  describe "request timeout" do
+    # A deliberately short timeout so tests finish quickly.
+    @timeout_ms 300
+
+    # Start a second httpd with the short timeout; override :port in context.
+    setup do
+      port = find_free_tcp_port()
+      config = [{[], %{handler: TestEchoHandler, handler_config: %{test_pid: self()}}}]
+
+      {:ok, server} =
+        :httpd.start_link(:any, port, %{}, %{request_timeout: @timeout_ms}, config)
+
+      Process.sleep(20)
+
+      on_exit(fn ->
+        if Process.alive?(server), do: :httpd.stop(server)
+      end)
+
+      {:ok, port: port}
+    end
+
+    test "closes socket when request headers are never completed", %{port: port} do
+      {:ok, socket} = connect(port)
+      # Send an incomplete request — no \r\n\r\n header terminator, so the
+      # server buffers and starts the request timer.
+      :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: example.com\r\n")
+
+      # Wait well past the configured timeout and expect the server to close.
+      Process.sleep(@timeout_ms + 200)
+      assert {:error, :closed} = :gen_tcp.recv(socket, 0, 500)
+      :gen_tcp.close(socket)
+    end
+
+    test "closes socket when declared body is never fully delivered", %{port: port} do
+      {:ok, socket} = connect(port)
+      # Headers are complete, but Content-Length claims 100 bytes and we only
+      # send 5.  The server should start waiting for the rest and time out.
+      :ok =
+        :gen_tcp.send(
+          socket,
+          "POST / HTTP/1.1\r\nHost: example.com\r\ncontent-length: 100\r\n\r\nhello"
+        )
+
+      Process.sleep(@timeout_ms + 200)
+      assert {:error, :closed} = :gen_tcp.recv(socket, 0, 500)
+      :gen_tcp.close(socket)
+    end
+  end
+
   defp connect(port) do
     :gen_tcp.connect(~c"localhost", port, [:binary, active: false, packet: :raw])
   end

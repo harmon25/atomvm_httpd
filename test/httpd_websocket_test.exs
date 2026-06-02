@@ -57,9 +57,10 @@ defmodule HttpdWebsocketTest do
       # Receive complete upgrade response
       response = read_http_response(socket)
       assert response =~ "HTTP/1.1 101 Switching Protocols"
-      assert response =~ "Upgrade: websocket"
-      assert response =~ "Connection: Upgrade"
-      assert response =~ "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+      # Response headers are normalized to lowercase keys by the server.
+      assert response =~ "upgrade: websocket"
+      assert response =~ "connection: Upgrade"
+      assert response =~ "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
 
       # Verify handler received init
       assert_receive {:ws_init, _websocket, _path}, @receive_timeout

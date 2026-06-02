@@ -34,6 +34,13 @@
 
 -callback handle_tcp_closed(Socket :: term(), State :: term()) -> NewState :: term().
 
+%% Optional callback: invoked for messages that gen_tcp_server does not handle
+%% itself (e.g. internal timer messages).  Return {noreply, NewState} to keep
+%% the connection open, or {close, Socket, NewState} to close a specific socket.
+-callback handle_info(Msg :: term(), State :: term()) ->
+    {noreply, NewState :: term()} | {close, Socket :: term(), NewState :: term()}.
+-optional_callbacks([handle_info/2]).
+
 % -define(TRACE_ENABLED, true).
 -include_lib("atomvm_httpd/include/trace.hrl").
 
@@ -146,10 +153,6 @@ handle_info({tcp_closed, Socket}, State) ->
     NewHandlerState = Handler:handle_tcp_closed(Socket, HandlerState),
     NewConns = maps:remove(Socket, Conns),
     {noreply, State#state{handler_state=NewHandlerState, connections=NewConns}};
-handle_info({request_timeout, Socket}, State) ->
-    ?TRACE("Request timeout for socket ~p", [Socket]),
-    try_close(Socket),
-    {noreply, State};
 handle_info({tcp, Socket, Packet}, State) ->
     ?TRACE("received packet: len(~p) from ~p", [erlang:byte_size(Packet), socket:peername(Socket)]),
     handle_tcp_data(Socket, Packet, State);
@@ -157,8 +160,23 @@ handle_info({'EXIT', _Pid, _Reason}, State) ->
     ?TRACE("Linked process ~p exited: ~p", [_Pid, _Reason]),
     {noreply, State};
 handle_info(Info, State) ->
-    io:format("Received spurious info msg: ~p~n", [Info]),
-    {noreply, State}.
+    %% Forward unrecognised messages to the handler if it exports handle_info/2.
+    %% The handler may return {noreply, NewState} or {close, Socket, NewState}.
+    #state{handler=Handler, handler_state=HandlerState} = State,
+    case erlang:function_exported(Handler, handle_info, 2) of
+        true ->
+            case Handler:handle_info(Info, HandlerState) of
+                {noreply, NewHandlerState} ->
+                    {noreply, State#state{handler_state = NewHandlerState}};
+                {close, Socket, NewHandlerState} ->
+                    ?TRACE("handle_info requested close for socket ~p", [Socket]),
+                    try_close(Socket),
+                    {noreply, State#state{handler_state = NewHandlerState}}
+            end;
+        false ->
+            io:format("Received spurious info msg: ~p~n", [Info]),
+            {noreply, State}
+    end.
 
 %% @hidden
 terminate(_Reason, _State) ->

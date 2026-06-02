@@ -17,8 +17,8 @@
 
 -module(httpd).
 
--export([start/2, start/3, start/4, start_link/2, start_link/3, start_link/4, stop/1]).
--export([init/1, handle_receive/3, handle_tcp_closed/2]).
+-export([start/2, start/3, start/4, start/5, start_link/2, start_link/3, start_link/4, start_link/5, stop/1]).
+-export([init/1, handle_receive/3, handle_tcp_closed/2, handle_info/2]).
 
 -ifdef(TEST).
 -export([maybe_parse_http_request/1, handle_request_state/3, get_request_state/1]).
@@ -80,29 +80,41 @@
 %% API
 %%
 
+-type options() :: #{
+    request_timeout => pos_integer()
+}.
+
 -spec start(Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start(Port, Config) ->
-    start(any, Port, #{}, Config).
+    start(any, Port, #{}, #{}, Config).
 
 -spec start(Address :: address(), Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start(Address, Port, Config) ->
-    start(Address, Port, #{}, Config).
+    start(Address, Port, #{}, #{}, Config).
 
 -spec start(Address :: address(), Port :: portnum(), SocketOptions :: map(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start(Address, Port, SocketOptions, Config) ->
-    gen_tcp_server:start(#{addr => Address, port => Port}, SocketOptions, ?MODULE, Config).
+    start(Address, Port, SocketOptions, #{}, Config).
+
+-spec start(Address :: address(), Port :: portnum(), SocketOptions :: map(), Options :: options(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
+start(Address, Port, SocketOptions, Options, Config) ->
+    gen_tcp_server:start(#{addr => Address, port => Port}, SocketOptions, ?MODULE, {Options, Config}).
 
 -spec start_link(Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Port, Config) ->
-    start_link(any, Port, #{}, Config).
+    start_link(any, Port, #{}, #{}, Config).
 
 -spec start_link(Address :: address(), Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Address, Port, Config) ->
-    start_link(Address, Port, #{}, Config).
+    start_link(Address, Port, #{}, #{}, Config).
 
 -spec start_link(Address :: address(), Port :: portnum(), SocketOptions :: map(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Address, Port, SocketOptions, Config) ->
-    gen_tcp_server:start_link(#{addr => Address, port => Port}, SocketOptions, ?MODULE, Config).
+    start_link(Address, Port, SocketOptions, #{}, Config).
+
+-spec start_link(Address :: address(), Port :: portnum(), SocketOptions :: map(), Options :: options(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
+start_link(Address, Port, SocketOptions, Options, Config) ->
+    gen_tcp_server:start_link(#{addr => Address, port => Port}, SocketOptions, ?MODULE, {Options, Config}).
 
 stop(Httpd) ->
     gen_tcp_server:stop(Httpd).
@@ -112,7 +124,11 @@ stop(Httpd) ->
 %%
 
 %% @hidden
+init({Options, Config}) ->
+    Timeout = maps:get(request_timeout, Options, 30000),
+    {ok, #state{config = Config, request_timeout = Timeout}};
 init(Config) ->
+    %% Backwards-compatible: called with just Config (no Options).
     {ok, #state{config = Config}}.
 
 %% @hidden
@@ -299,7 +315,10 @@ call_http_req_handler(Socket, HttpRequest, State) ->
         {noreply, NewHandlerState} ->
             NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
             {noreply, NewState};
-        %% reply — handler wants to keep the connection open; honour keep-alive if requested
+        %% reply — always keeps the socket open (gen_tcp_server treats {reply,...} as keep-open).
+        %% NOTE: HTTP/1.0 default-close and Connection: close semantics are not yet implemented;
+        %% that negotiation is deferred to a follow-up.  Handlers that need to force a close
+        %% should return {close, ...} instead.
         {reply, Reply, NewHandlerState} ->
             NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
             {reply, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply), NewState};
@@ -356,6 +375,31 @@ handle_tcp_closed(Socket, State) ->
             NewWebSocketMap = maps:remove(Socket, CleanState#state.ws_socket_map),
             CleanState#state{ws_socket_map = NewWebSocketMap}
     end.
+
+%% @hidden
+%% Validate timer-tagged request timeout messages.  Using the TimerRef in the
+%% message tag makes this race-free: if stop_request_timer/2 cancelled the
+%% timer before the message was delivered, the ref will no longer be in
+%% pending_timer_map and we ignore the stale message; if the timer fired first,
+%% the ref matches and we correctly close the socket.
+handle_info({request_timeout, Socket, Tag}, State) ->
+    TimerMap = State#state.pending_timer_map,
+    case maps:get(Socket, TimerMap, undefined) of
+        {_TimerRef, Tag} ->
+            %% Tag matches the current timer — the request genuinely timed out.
+            ?TRACE("Request timeout confirmed for socket ~p (tag ~p)", [Socket, Tag]),
+            NewTimerMap = maps:remove(Socket, TimerMap),
+            NewState = State#state{pending_timer_map = NewTimerMap},
+            {close, Socket, NewState};
+        _ ->
+            %% Tag does not match: timer was cancelled and a new one installed
+            %% (keep-alive), or the entry was already removed (request completed).
+            %% Ignore the stale message.
+            ?TRACE("Ignoring stale request_timeout for socket ~p (tag ~p)", [Socket, Tag]),
+            {noreply, State}
+    end;
+handle_info(_Msg, State) ->
+    {noreply, State}.
 
 %%
 %% Internal functions
@@ -627,7 +671,12 @@ create_reply(StatusCode, ContentType, Reply) when is_list(ContentType) orelse is
     create_reply(StatusCode, #{"Content-Type" => ContentType}, Reply);
 create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
     ReplyLen = erlang:iolist_size(Reply),
-    HeadersWithLen = ensure_content_length(Headers, ReplyLen),
+    %% Normalize all header keys to lowercase binary before computing
+    %% Content-Length so that ensure_content_length/2 can reliably strip any
+    %% pre-existing content-length variant (e.g. "Content-Length", <<"Content-Length">>)
+    %% and avoid emitting duplicate headers.
+    NormalizedHeaders = normalize_headers(Headers),
+    HeadersWithLen = ensure_content_length(NormalizedHeaders, ReplyLen),
     [
         <<"HTTP/1.1 ">>, erlang:integer_to_binary(StatusCode), <<" ">>, moniker(StatusCode),
         <<"\r\n">>,
@@ -638,8 +687,31 @@ create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
     ].
 
 %% @private
+%% Rewrite every key in a response-header map to a lowercase binary so that
+%% ensure_content_length/2 and to_headers_list/1 always operate on a uniform
+%% representation regardless of whether the caller used strings, binaries, or
+%% mixed-case atoms.
+normalize_headers(Headers) ->
+    maps:fold(
+        fun(Key, Value, Acc) ->
+            NormKey = normalize_header_key(Key),
+            Acc#{NormKey => Value}
+        end,
+        #{},
+        Headers
+    ).
+
+normalize_header_key(Key) when is_binary(Key) ->
+    list_to_binary(string:to_lower(binary_to_list(Key)));
+normalize_header_key(Key) when is_list(Key) ->
+    list_to_binary(string:to_lower(Key));
+normalize_header_key(Key) when is_atom(Key) ->
+    list_to_binary(string:to_lower(atom_to_list(Key))).
+
+%% @private
 ensure_content_length(Headers, ReplyLen) ->
     LenBin = erlang:integer_to_binary(ReplyLen),
+    %% After normalize_headers/1 the key is always <<"content-length">>.
     CleanHeaders = maps:remove(<<"content-length">>, Headers),
     CleanHeaders#{<<"content-length">> => LenBin}.
 
@@ -699,29 +771,32 @@ method_to_atom(_) ->
     undefined.
 
 %% @private
+%% Each timer entry is stored as {TimerRef, Tag} where Tag = make_ref().
+%% Tag is embedded in the {request_timeout, Socket, Tag} message so that
+%% handle_info/2 can compare it against the current map entry and safely
+%% ignore any stale messages that arrive after cancel_timer/1 was called
+%% (they carry an old Tag that no longer matches).  This makes the timeout
+%% handling race-free without needing a receive-flush.
 start_request_timer(Socket, State) ->
     Timeout = State#state.request_timeout,
     TimerMap = State#state.pending_timer_map,
-    %% Cancel any pre-existing timer for this socket to avoid stale timeout
-    %% messages being delivered to a keep-alive connection.
+    %% Cancel any pre-existing timer for this socket.
     case maps:get(Socket, TimerMap, undefined) of
         undefined -> ok;
-        OldRef ->
-            erlang:cancel_timer(OldRef),
-            %% Flush a stale timeout message that may already be in the mailbox.
-            receive {request_timeout, Socket} -> ok after 0 -> ok end
+        {OldRef, _OldTag} -> erlang:cancel_timer(OldRef)
     end,
-    TimerRef = erlang:send_after(Timeout, self(), {request_timeout, Socket}),
-    State#state{pending_timer_map = TimerMap#{Socket => TimerRef}}.
+    Tag = make_ref(),
+    TimerRef = erlang:send_after(Timeout, self(), {request_timeout, Socket, Tag}),
+    State#state{pending_timer_map = TimerMap#{Socket => {TimerRef, Tag}}}.
 
 %% @private
 stop_request_timer(Socket, State) ->
     TimerMap = State#state.pending_timer_map,
-    %% Cancel the timer so it never fires after the request completes.
+    %% Cancel the timer.  Any {request_timeout, Socket, Tag} already in the
+    %% mailbox carries the old Tag; handle_info/2 will ignore it because we
+    %% remove the entry from pending_timer_map here — no receive-flush needed.
     case maps:get(Socket, TimerMap, undefined) of
         undefined -> ok;
-        Ref ->
-            erlang:cancel_timer(Ref),
-            receive {request_timeout, Socket} -> ok after 0 -> ok end
+        {Ref, _Tag} -> erlang:cancel_timer(Ref)
     end,
     State#state{pending_timer_map = maps:remove(Socket, TimerMap)}.

@@ -44,13 +44,6 @@
 % -define(TRACE_ENABLED, true).
 -include_lib("atomvm_httpd/include/trace.hrl").
 
--record(state, {
-    handler,
-    handler_state,
-    connections = #{},
-    max_connections = 0
-}).
-
 -define(DEFAULT_BIND_OPTIONS, #{
     family => inet,
     addr => any
@@ -58,8 +51,19 @@
 -define(DEFAULT_SOCKET_OPTIONS, #{
     {socket, reuseaddr} => true
 }).
-%% Smaller chunks work better with lwIP's limited buffers
--define(MAX_SEND_CHUNK, 1460).  %% TCP MSS - fits in single packet without fragmentation
+%% Default send-chunk size.  4096 is a comfortable fit within the ESP32 lwIP
+%% send-buffer (8 KB by default) and cuts NIF-crossing overhead by ~3× versus
+%% the old 1460-byte (single TCP MSS) default.  Callers can override via the
+%% `chunk_size` key in the SocketOptions map passed to start/4 / start_link/4.
+-define(DEFAULT_SEND_CHUNK, 4096).
+
+-record(state, {
+    handler,
+    handler_state,
+    connections = #{},
+    max_connections = 0,
+    send_chunk_size = ?DEFAULT_SEND_CHUNK
+}).
 
 %%
 %% API
@@ -88,9 +92,10 @@ stop(Server) ->
 init({BindOptions, SocketOptions, Handler, Args}) ->
     Self = self(),
     MaxConnections = maps:get(max_connections, SocketOptions, 0),
-    %% Strip max_connections before passing to set_socket_options/2 so that
-    %% socket:setopt/3 is never called with an unknown option key.
-    CleanSocketOptions = maps:remove(max_connections, SocketOptions),
+    ChunkSize = maps:get(chunk_size, SocketOptions, ?DEFAULT_SEND_CHUNK),
+    %% Strip application-level keys before passing to set_socket_options/2 so
+    %% that socket:setopt/3 is never called with an unknown option key.
+    CleanSocketOptions = maps:without([max_connections, chunk_size], SocketOptions),
     case socket:open(inet, stream, tcp) of
         {ok, Socket} ->
             ok = set_socket_options(Socket, CleanSocketOptions),
@@ -101,7 +106,12 @@ init({BindOptions, SocketOptions, Handler, Args}) ->
                             spawn_link(fun() -> accept(Self, Socket) end),
                             case Handler:init(Args) of
                                 {ok, HandlerState} ->
-                                    {ok, #state{handler = Handler, handler_state = HandlerState, max_connections = MaxConnections}};
+                                    {ok, #state{
+                                        handler = Handler,
+                                        handler_state = HandlerState,
+                                        max_connections = MaxConnections,
+                                        send_chunk_size = ChunkSize
+                                    }};
                                 HandlerError ->
                                     try_close(Socket),
                                     {stop, {handler_error, HandlerError}}
@@ -184,11 +194,11 @@ terminate(_Reason, _State) ->
 
 %% @private
 handle_tcp_data(Socket, Packet, State) ->
-    #state{handler=Handler, handler_state=HandlerState} = State,
+    #state{handler=Handler, handler_state=HandlerState, send_chunk_size=MaxChunk} = State,
     case Handler:handle_receive(Socket, Packet, HandlerState) of
         {reply, ResponsePacket, ResponseState} ->
             ?TRACE("Sending reply to endpoint ~p", [socket:peername(Socket)]),
-            case try_send(Socket, ResponsePacket) of
+            case try_send(Socket, ResponsePacket, MaxChunk) of
                 ok ->
                     {noreply, State#state{handler_state=ResponseState}};
                 {error, closed} ->
@@ -203,7 +213,7 @@ handle_tcp_data(Socket, Packet, State) ->
             {noreply, State#state{handler_state=ResponseState}};
         {close, ResponsePacket} ->
             ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
-            case try_send(Socket, ResponsePacket) of
+            case try_send(Socket, ResponsePacket, MaxChunk) of
                 ok ->
                     try_close(Socket);
                 {error, closed} ->
@@ -227,55 +237,52 @@ handle_tcp_data(Socket, Packet, State) ->
 %%
 
 %% @private
-try_send(Socket, Packet) when is_binary(Packet) ->
+try_send(Socket, Packet, MaxChunk) when is_binary(Packet) ->
     ?TRACE(
         "Trying to send binary packet data to socket ~p.  Packet (or len): ~p", [
         Socket, case byte_size(Packet) < 32 of true -> Packet; _ -> byte_size(Packet) end
     ]),
-    try_send_binary(Socket, Packet);
-try_send(Socket, Byte) when is_integer(Byte) ->
+    try_send_binary(Socket, Packet, MaxChunk);
+try_send(Socket, Byte, MaxChunk) when is_integer(Byte) ->
     %% Handles bytes (0-255) in iolists. Unicode must be pre-encoded to UTF-8.
     ?TRACE("Sending byte ~p as ~p", [Byte, <<Byte:8>>]),
-    try_send(Socket, <<Byte:8>>);
-try_send(Socket, List) when is_list(List) ->
+    try_send(Socket, <<Byte:8>>, MaxChunk);
+try_send(Socket, List, MaxChunk) when is_list(List) ->
     case is_string(List) of
         true ->
-            try_send(Socket, list_to_binary(List));
+            try_send(Socket, list_to_binary(List), MaxChunk);
         _ ->
-            try_send_iolist(Socket, List)
+            try_send_iolist(Socket, List, MaxChunk)
     end.
 
-try_send_iolist(_Socket, []) ->
+try_send_iolist(_Socket, [], _MaxChunk) ->
     ok;
-try_send_iolist(Socket, [H | T]) ->
-    case try_send(Socket, H) of
+try_send_iolist(Socket, [H | T], MaxChunk) ->
+    case try_send(Socket, H, MaxChunk) of
         ok ->
-            try_send_iolist(Socket, T);
+            try_send_iolist(Socket, T, MaxChunk);
         {error, _Reason} = Error ->
             Error
     end.
 
-try_send_binary(_Socket, <<>>) ->
+try_send_binary(_Socket, <<>>, _MaxChunk) ->
     ok;
-try_send_binary(Socket, Packet) when is_binary(Packet) ->
+try_send_binary(Socket, Packet, MaxChunk) when is_binary(Packet) ->
     TotalSize = byte_size(Packet),
-    ChunkSize = erlang:min(TotalSize, ?MAX_SEND_CHUNK),
+    ChunkSize = erlang:min(TotalSize, MaxChunk),
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
     case socket:send(Socket, Chunk) of
         ok ->
             %% Give the scheduler a chance to run and let TCP drain
             maybe_yield(Rest),
-            try_send_binary(Socket, Rest);
+            try_send_binary(Socket, Rest, MaxChunk);
         {ok, Remaining} ->
             %% Partial send - combine remaining with rest and retry
-            try_send_binary(Socket, <<Remaining/binary, Rest/binary>>);
+            try_send_binary(Socket, <<Remaining/binary, Rest/binary>>, MaxChunk);
         {error, closed} ->
-            %% Only log if we actually had more data to send
-            case byte_size(Rest) of
-                0 -> ok;  %% Sent everything, client just closed after - that's fine
-                _ -> io:format("Connection closed mid-transfer (~p/~p bytes sent)~n", 
-                               [ChunkSize, TotalSize])
-            end,
+            %% Normal client behaviour (tab close, image swap, parallel request racing ahead).
+            %% Log at TRACE only — this fires dozens of times per minute on camera streams.
+            ?TRACE("Connection closed mid-transfer (~p/~p bytes sent)", [ChunkSize, TotalSize]),
             {error, closed};
         {error, Reason} ->
             io:format("Send error: ~p (chunk: ~p, total: ~p)~n", 

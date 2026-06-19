@@ -295,6 +295,94 @@ defmodule HttpdIntegrationTest do
     end
   end
 
+  describe "chunk_size socket option" do
+    # Deliberately small chunk size to exercise multi-chunk send path on a
+    # small test body, and verify the key is stripped so socket:setopt is
+    # never called with it (which would crash with a badmatch).
+    @small_chunk 512
+    @large_response_body :binary.copy("x", 16_384)
+
+    setup do
+      port = find_free_tcp_port()
+
+      config = [
+        {[], %{handler: TestEchoHandler, handler_config: %{test_pid: self()}}}
+      ]
+
+      {:ok, server} =
+        :httpd.start_link(:any, port, %{chunk_size: @small_chunk}, config)
+
+      Process.sleep(20)
+
+      on_exit(fn ->
+        if Process.alive?(server), do: :httpd.stop(server)
+      end)
+
+      {:ok, port: port}
+    end
+
+    test "server starts successfully with chunk_size option (option is not passed to socket:setopt)",
+         %{port: port} do
+      # If chunk_size leaked into set_socket_options/2 the server would have
+      # crashed at startup — this assertion also validates that.
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok =
+          :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+        assert {:ok, response} = recv_all(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "large response body is delivered intact across many small chunks" do
+      # Start a fresh server whose handler is configured to reply with the large
+      # body — this exercises the multi-chunk send path without coupling to the
+      # echo handler's default behaviour.
+      port = find_free_tcp_port()
+      body_size = byte_size(@large_response_body)
+
+      config = [
+        {[],
+         %{
+           handler: TestEchoHandler,
+           handler_config: %{
+             test_pid: self(),
+             reply_body: @large_response_body,
+             reply_headers: %{"Content-Type" => "application/octet-stream"}
+           }
+         }}
+      ]
+
+      {:ok, server} =
+        :httpd.start_link(:any, port, %{chunk_size: @small_chunk}, config)
+
+      Process.sleep(20)
+
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+        assert_receive {:http_request, _}, @receive_timeout
+
+        assert {:ok, response} = recv_all(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+
+        [_headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+
+        assert byte_size(body) == body_size,
+               "Expected #{body_size} bytes; got #{byte_size(body)}"
+      after
+        :gen_tcp.close(socket)
+        :httpd.stop(server)
+      end
+    end
+  end
+
   describe "request timeout" do
     # A deliberately short timeout so tests finish quickly.
     @timeout_ms 300

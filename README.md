@@ -42,7 +42,7 @@ At a high level, this server supports the following features:
   - Server-initiated push messages
 - **ESP32-optimized networking**
   - Configurable socket options (`SO_REUSEADDR`, buffer sizes, etc.)
-  - 1460-byte send chunking for lwIP compatibility
+  - Configurable send chunking (default 4096 bytes) for lwIP compatibility
   - Incremental I/O list processing to minimize heap pressure
 
 The HTTPd server is designed around a callback architecture, whereby users implement behaviors to handle various requests into the HTTP server. This architecture allows developers to focus on the logic of their applications, as opposed to the nitty gritty details of the HTTP protocol, while still providing access to contextual information about the request, including:
@@ -138,6 +138,10 @@ Supported socket options (per AtomVM's `socket` module):
 - `{socket, linger}` - `#{onoff => boolean(), linger => non_neg_integer()}` - Control connection close behavior
 - `{otp, recvbuf}` - `non_neg_integer()` - Receive buffer size in bytes
 - `{ip, add_membership}` - Multicast group membership (advanced)
+
+The following keys are handled by `gen_tcp_server` itself and are **not** passed to `socket:setopt`:
+- `max_connections` - `non_neg_integer()` - Maximum concurrent connections (0 = unlimited, default)
+- `chunk_size` - `pos_integer()` - Maximum bytes per `socket:send/2` call (default: `4096`). Tune this to match your platform's lwIP send-buffer headroom. A 100 KB JPEG at 4096 bytes/chunk requires ~25 send calls; at 1460 bytes it required ~70. ESP32 lwIP defaults to an 8 KB send buffer, so values up to 8192 are generally safe.
 
 The default configuration enables `SO_REUSEADDR` which is particularly useful on ESP32 for quick restarts during development.
 

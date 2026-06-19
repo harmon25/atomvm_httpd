@@ -95,7 +95,7 @@ init({BindOptions, SocketOptions, Handler, Args}) ->
     ChunkSize = maps:get(chunk_size, SocketOptions, ?DEFAULT_SEND_CHUNK),
     %% Strip application-level keys before passing to set_socket_options/2 so
     %% that socket:setopt/3 is never called with an unknown option key.
-    CleanSocketOptions = maps:without([max_connections, chunk_size], SocketOptions),
+    CleanSocketOptions = maps:remove(chunk_size, maps:remove(max_connections, SocketOptions)),
     case socket:open(inet, stream, tcp) of
         {ok, Socket} ->
             ok = set_socket_options(Socket, CleanSocketOptions),

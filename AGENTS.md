@@ -112,3 +112,71 @@ not `io:format`.
 
 - Active development branch is `improvements` (not `main`); README dep examples pin `main`.
 - Erlang `src/` is the source of truth; `lib/atomvm_httpd.ex` is only a convenience wrapper.
+
+## ESP32 Debug Loop (examples/httpd_debug/)
+
+A complete debug/test application for iterating on ESP32 hardware with real-world HTTP loads.
+
+### Setup (one-time)
+
+1. **WiFi credentials** (compile-time):
+   ```bash
+   export ATOMVM_WIFI_SSID="your-ssid"
+   export ATOMVM_WIFI_PSK="your-password"
+   ```
+
+2. **ESP32 connection**: Connect ESP32-S3 to `/dev/ttyACM0` (or update scripts if different port).
+
+3. **ESP-IDF environment**: Already available via `get_idf` alias (sources `$HOME/.espressif/v5.5.4/esp-idf/export.sh`). Flash script sources this automatically.
+
+### Iteration cycle
+
+```bash
+cd examples/httpd_debug
+
+# 1. Edit code in src/ (library) or lib/ (test app)
+
+# 2. Build and flash (kills existing monitor, builds, flashes to ESP32)
+./scripts/flash.sh
+
+# 3. Monitor serial output (logs to /tmp/atomvm_serial.log)
+./scripts/monitor.sh
+# Watch for: "HTTPD ready at http://X.X.X.X:80"
+
+# 4. Test via browser or automated suite
+open http://X.X.X.X/              # Browser dashboard
+./scripts/test.sh X.X.X.X         # Automated curl tests
+
+# 5. Check serial log for crashes/errors
+grep -i "error\|crash\|abort" /tmp/atomvm_serial.log
+
+# 6. Fix and repeat
+```
+
+### What's included
+
+- **Debug API endpoints** (`/api/ping`, `/api/echo`, `/api/generate?size=N`, `/api/memory`):
+  Stress-test request/response sizes up to 1MB. Every request logs heap state to serial.
+- **Built-in stats** (`/api/stats/system`, `/api/stats/memory`): Platform info + ESP32 heap.
+- **Command API** (`/api/cmd/restart`): Restart ESP32 over HTTP.
+- **Browser dashboard** (`/`): Interactive UI for triggering tests, viewing results, monitoring memory.
+- **Automated test suite** (`scripts/test.sh`): Sweeps response sizes (100B → 64KB) and upload sizes (100B → 16KB), reports pass/fail + timing.
+
+### Tuning parameters
+
+- **`chunk_size`** (default 4096): Set in `lib/httpd_debug.ex` line 13. AtomVM lwIP default send buffer is 8KB; values up to 8192 are safe.
+- **Request timeout** (default 30s): Set via `:httpd.start_link/5` options map (not currently exposed in debug app, but easy to add).
+
+### AI agent workflow
+
+When debugging performance issues or crashes on hardware:
+
+1. **Flash**: `bash examples/httpd_debug/scripts/flash.sh` (Read tool to check output)
+2. **Monitor**: `bash examples/httpd_debug/scripts/monitor.sh` in background, or Read `/tmp/atomvm_serial.log`
+3. **Extract IP**: Grep serial log for `"HTTPD ready at http://"`
+4. **Test**: `bash examples/httpd_debug/scripts/test.sh <ip>` or individual curl commands
+5. **Analyze**: Read serial log for crash traces (Guru Meditation, stack dumps), parse test failures
+6. **Edit**: Make fixes in `src/` (library code) or `examples/httpd_debug/lib/` (test app)
+7. **Iterate**: Return to step 1
+
+Serial log persists at `/tmp/atomvm_serial.log` across monitor restarts for post-mortem analysis.

@@ -48,23 +48,28 @@ get_system_info() ->
     #{
         platform => atomvm:platform(),
         word_size => erlang:system_info(wordsize),
-        system_architecture => erlang:system_info(system_architecture),
-        atomvm_version => erlang:system_info(atomvm_version),
+        system_architecture => to_binary(erlang:system_info(system_architecture)),
+        atomvm_version => to_binary(erlang:system_info(atomvm_version)),
         esp32_chip_info => get_esp32_chip_info(),
-        esp_idf_version => list_to_binary(erlang:system_info(esp_idf_version))
+        esp_idf_version => to_binary(erlang:system_info(esp_idf_version))
     }.
+
+to_binary(Value) when is_binary(Value) -> Value;
+to_binary(Value) when is_list(Value) -> list_to_binary(Value);
+to_binary(Value) when is_atom(Value) -> atom_to_binary(Value, utf8);
+to_binary(_) -> <<"unknown">>.
 
 get_esp32_chip_info() ->
     case erlang:system_info(esp32_chip_info) of
         undefined ->
-            undefined;
+            null;
         %% TODO remove old API
         {esp32, Features, Cores, Revision} ->
-            [{features, Features}, {cores, Cores}, {revision, Revision}, {model, undefined}];
+            #{features => Features, cores => Cores, revision => Revision, model => null};
         Info when is_map(Info) ->
-            maps:to_list(Info);
+            Info;
         _ ->
-            unknown
+            null
     end.
 
 get_memory() ->

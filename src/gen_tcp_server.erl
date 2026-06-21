@@ -30,7 +30,7 @@
     {ok, State :: term()} | {stop, Reason :: term()}.
 
 -callback handle_receive(Socket :: term(), Packet :: binary(), State :: term()) ->
-    {reply, Packet :: iolist(), NewState :: term()} | {noreply, NewState :: term()} | {close, Packet :: iolist()} | close.
+    {reply, Packet :: iolist(), NewState :: term()} | {noreply, NewState :: term()} | {close, Packet :: iolist()} | {close, Packet :: iolist(), NewState :: term()} | close.
 
 -callback handle_tcp_closed(Socket :: term(), State :: term()) -> NewState :: term().
 
@@ -222,6 +222,17 @@ handle_tcp_data(Socket, Packet, State) ->
                     try_close(Socket)
             end,
             {noreply, State};
+        {close, ResponsePacket, ResponseState} ->
+            ?TRACE("Sending reply to endpoint ~p and closing socket: ~p", [socket:peername(Socket), Socket]),
+            case try_send(Socket, ResponsePacket, MaxChunk) of
+                ok ->
+                    try_close(Socket);
+                {error, closed} ->
+                    ok;
+                {error, _Reason} ->
+                    try_close(Socket)
+            end,
+            {noreply, State#state{handler_state=ResponseState}};
         close  ->
             ?TRACE("Closing socket ~p", [Socket]),
             try_close(Socket),
@@ -248,22 +259,13 @@ try_send(Socket, Byte, MaxChunk) when is_integer(Byte) ->
     ?TRACE("Sending byte ~p as ~p", [Byte, <<Byte:8>>]),
     try_send(Socket, <<Byte:8>>, MaxChunk);
 try_send(Socket, List, MaxChunk) when is_list(List) ->
-    case is_string(List) of
-        true ->
-            try_send(Socket, list_to_binary(List), MaxChunk);
-        _ ->
-            try_send_iolist(Socket, List, MaxChunk)
-    end.
-
-try_send_iolist(_Socket, [], _MaxChunk) ->
-    ok;
-try_send_iolist(Socket, [H | T], MaxChunk) ->
-    case try_send(Socket, H, MaxChunk) of
-        ok ->
-            try_send_iolist(Socket, T, MaxChunk);
-        {error, _Reason} = Error ->
-            Error
-    end.
+    %% Flatten the entire iolist to a single binary before sending.
+    %% This avoids walking deeply nested iolists (e.g. from json:encode)
+    %% element-by-element, which generates hundreds of tiny socket:send
+    %% NIF calls.  A single flattened binary lets try_send_binary chunk
+    %% it into MaxChunk slices — far fewer NIF crossings and much better
+    %% throughput on AtomVM/ESP32.
+    try_send_binary(Socket, erlang:iolist_to_binary(List), MaxChunk).
 
 try_send_binary(_Socket, <<>>, _MaxChunk) ->
     ok;
@@ -273,35 +275,35 @@ try_send_binary(Socket, Packet, MaxChunk) when is_binary(Packet) ->
     <<Chunk:ChunkSize/binary, Rest/binary>> = Packet,
     case socket:send(Socket, Chunk) of
         ok ->
-            %% Give the scheduler a chance to run and let TCP drain
-            maybe_yield(Rest),
+            %% Entire chunk accepted.  Yield then continue with rest.
+            case byte_size(Rest) > 0 of
+                true -> receive after 0 -> ok end;
+                false -> ok
+            end,
             try_send_binary(Socket, Rest, MaxChunk);
-        {ok, Remaining} ->
-            %% Partial send - combine remaining with rest and retry
-            try_send_binary(Socket, <<Remaining/binary, Rest/binary>>, MaxChunk);
+        {ok, Unsent} ->
+            %% Partial send — on AtomVM/ESP32, socket:send only writes
+            %% TCP_MSS (1440) bytes per tcp_write call, so partial sends
+            %% are the norm, not the exception.  When the TCP send buffer
+            %% is full (ERR_MEM), zero bytes are written and the full
+            %% chunk is returned.
+            %%
+            %% In all cases we yield for 10 ms to let the lwIP stack
+            %% transmit queued data and process incoming ACKs.  Without
+            %% this delay the send loop can starve the TCP stack and
+            %% cause the connection to stall.
+            receive after 10 -> ok end,
+            try_send_binary(Socket, <<Unsent/binary, Rest/binary>>, MaxChunk);
         {error, closed} ->
-            %% Normal client behaviour (tab close, image swap, parallel request racing ahead).
-            %% Log at TRACE only — this fires dozens of times per minute on camera streams.
             ?TRACE("Connection closed mid-transfer (~p/~p bytes sent)", [ChunkSize, TotalSize]),
             {error, closed};
         {error, Reason} ->
-            io:format("Send error: ~p (chunk: ~p, total: ~p)~n", 
+            io:format("Send error: ~p (chunk: ~p, total: ~p)~n",
                       [Reason, ChunkSize, TotalSize]),
             {error, Reason}
     end.
 
-%% Lightweight yield using receive timeout - works in AtomVM
-maybe_yield(<<>>) ->
-    ok;
-maybe_yield(_) ->
-    receive after 0 -> ok end.
 
-is_string([]) ->
-    true;
-is_string([H | T]) when is_integer(H) ->
-    is_string(T);
-is_string(_) ->
-    false.
 
 %% @private
 try_close(Socket) ->

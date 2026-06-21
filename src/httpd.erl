@@ -142,13 +142,13 @@ handle_receive(Socket, Packet, State) ->
                     ok ->
                         {noreply, State};
                     Error ->
-                        {close, create_error(?INTERNAL_SERVER_ERROR, Error)}
+                        {close, create_error(?INTERNAL_SERVER_ERROR, Error), State}
                 end
         end
     catch
         A:E:S ->
             io:format("Caught error: ~p:~p:~p~n", [A, E, S]),
-            {close, create_error(?BAD_REQUEST, E)}
+            {close, create_error(?BAD_REQUEST, E), State}
     end.
 
 %% @private
@@ -173,7 +173,7 @@ handle_http_request(Socket, Packet, State) ->
                     } = HttpRequest,
                     case Method of
                         undefined ->
-                            {close, create_error(?NOT_ALLOWED, method_not_allowed)};
+                            {close, create_error(?NOT_ALLOWED, method_not_allowed), CleanState};
                         _ ->
                             case get_protocol(Method, Headers) of
                         http ->
@@ -188,7 +188,7 @@ handle_http_request(Socket, Packet, State) ->
                                     },
                                     handle_request_state(Socket, NewHttpRequest, CleanState);
                                 Error ->
-                                    {close, create_error(?INTERNAL_SERVER_ERROR, Error)}
+                                    {close, create_error(?INTERNAL_SERVER_ERROR, Error), CleanState}
                             end;
                         ws ->
                             ?TRACE("Protocol is ws", []),
@@ -214,18 +214,18 @@ handle_http_request(Socket, Packet, State) ->
                                                     {reply, Reply, NewState};
                                                 Error ->
                                                     ?TRACE("Web socket error: ~p", [Error]),
-                                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error}), CleanState}
                                             end;
                                         Error ->
-                                            {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                                            {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error}), CleanState}
                                     end;
                                 error ->
-                                    {close, create_error(?BAD_REQUEST, missing_websocket_key)}
+                                    {close, create_error(?BAD_REQUEST, missing_websocket_key), CleanState}
                             end
                     end
                     end;
                 {error, Reason} ->
-                    {close, create_error(?BAD_REQUEST, Reason)}
+                    {close, create_error(?BAD_REQUEST, Reason), State}
             end;
         PendingHttpRequest ->
             ?TRACE("Packetlen: ~p", [erlang:byte_size(Packet)]),
@@ -332,19 +332,19 @@ call_http_req_handler(Socket, HttpRequest, State) ->
             {close, State};
         {close, Reply} ->
             ReplyPacket = create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply),
-            {close, ReplyPacket};
+            {close, ReplyPacket, State};
         {close, ReplyHeaders, Reply} ->
             ReplyPacket = create_reply(?OK, ReplyHeaders, Reply),
-            {close, ReplyPacket};
+            {close, ReplyPacket, State};
         %% errors
         {error, not_found} ->
-            {close, create_error(?NOT_FOUND, not_found)};
+            {close, create_error(?NOT_FOUND, not_found), State};
         {error, bad_request} ->
-            {close, create_error(?BAD_REQUEST, bad_request)};
+            {close, create_error(?BAD_REQUEST, bad_request), State};
         {error, internal_server_error} ->
-            {close, create_error(?INTERNAL_SERVER_ERROR, internal_server_error)};
+            {close, create_error(?INTERNAL_SERVER_ERROR, internal_server_error), State};
         HandlerError ->
-            {close, create_error(?INTERNAL_SERVER_ERROR, HandlerError)}
+            {close, create_error(?INTERNAL_SERVER_ERROR, HandlerError), State}
     end.
 
 %% @private

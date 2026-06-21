@@ -65,12 +65,12 @@ handle_http_req(HttpRequest, State) ->
                     {close, #{"Content-Type" => "text/plain"}, Reply};
                 {ok, Reply} when is_map(Reply) ->
                     ?TRACE("Encoding reply ~p", [Reply]),
-                    Body = json_encoder:encode(Reply),
+                    Body = json:encode(Reply),
                     ?TRACE("JSON Body: ~p", [Body]),
                     {close, #{"Content-Type" => "application/json"}, Body};
                 {close, Reply} ->
                     ?TRACE("Encoding reply ~p", [Reply]),
-                    Body = json_encoder:encode(Reply),
+                    Body = json:encode(Reply),
                     ?TRACE("JSON Body: ~p", [Body]),
                     {close, #{"Content-Type" => "application/json"}, Body};
                 Error ->
@@ -80,7 +80,7 @@ handle_http_req(HttpRequest, State) ->
             case Fun(Method, PathSuffix, HttpRequest, Args) of
                 {ok, Reply, State} ->
                     ?TRACE("Encoding reply ~p", [Reply]),
-                    Body = json_encoder:encode(Reply),
+                    Body = json:encode(Reply),
                     {close, #{"Content-Type" => "application/json"}, Body};
                 Error ->
                     Error

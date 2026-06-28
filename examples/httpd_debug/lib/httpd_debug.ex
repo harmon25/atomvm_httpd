@@ -17,9 +17,18 @@ defmodule HttpdDebug do
 
   @chunk_size 4096
 
+  # Delay before retrying after a WiFi/HTTPD startup failure. AtomVM does not
+  # implement erlang:halt/1, and halting would end the soak anyway, so instead
+  # we loop and retry forever — the device self-heals across AP outages, which
+  # is essential for multi-hour/day endurance runs.
+  @retry_delay 5_000
+
   def start do
     IO.puts("HttpdDebug starting...")
+    run()
+  end
 
+  defp run do
     # Connect to WiFi and wait for IP
     case HttpdDebug.WiFi.connect() do
       {:ok, ip_info} ->
@@ -34,13 +43,15 @@ defmodule HttpdDebug do
             Process.sleep(:infinity)
 
           {:error, reason} ->
-            IO.puts("ERROR: Failed to start HTTPD: #{inspect(reason)}")
-            :erlang.halt(1)
+            IO.puts("ERROR: Failed to start HTTPD: #{inspect(reason)}; retrying in 5s")
+            Process.sleep(@retry_delay)
+            run()
         end
 
       {:error, reason} ->
-        IO.puts("ERROR: WiFi connection failed: #{inspect(reason)}")
-        :erlang.halt(1)
+        IO.puts("ERROR: WiFi connection failed: #{inspect(reason)}; retrying in 5s")
+        Process.sleep(@retry_delay)
+        run()
     end
   end
 

@@ -4,11 +4,14 @@ Complete debug/test application for iterating on ESP32 hardware with real-world 
 
 ## Features
 
-- **WiFi STA connectivity** with compile-time credential injection
+- **WiFi STA connectivity** with compile-time credential injection; self-healing
+  (retries association and never halts, so it survives AP outages during long runs)
 - **Debug API endpoints** for stress-testing various request/response sizes
 - **Built-in stats handlers** for system info and memory monitoring
 - **Browser test dashboard** with interactive controls
 - **Automated test suite** with curl-based size sweeps
+- **Endurance/soak harness** (`scripts/soak.sh` + `scripts/soak_analyze.sh`) for
+  unattended multi-hour/day stability runs — see [SOAK.md](./SOAK.md)
 - **Serial monitoring** with persistent logs for debugging
 
 ## Prerequisites
@@ -147,12 +150,16 @@ export ATOMVM_WIFI_PSK="new-password"
 
 ### Tuning
 
-**chunk_size** (default 4096): Edit `lib/httpd_debug.ex` line 13:
+**chunk_size** (default 4096): Edit the `@chunk_size` attribute in `lib/httpd_debug.ex`:
 ```elixir
-@chunk_size 8192  # or another value
+@chunk_size 4096  # or another value
 ```
 
-AtomVM lwIP default send buffer is 8KB, so values up to 8192 are safe.
+ESP32's lwIP send buffer is small (a few KB, ~`4 × TCP_MSS`), and lwIP accepts at
+most `TCP_MSS` (~1440 B) per `socket:send`, so a larger `chunk_size` just loops
+internally. The library's `tcp_server:do_send/3` retries on send-buffer
+backpressure, so large responses complete reliably regardless; 2048–4096 is a
+sensible range.
 
 **request_timeout** (default 30s): Modify `start_httpd/0` to use `:httpd.start_link/5`:
 ```elixir
@@ -197,29 +204,37 @@ Wrong baud rate. The monitor uses 115200; if AtomVM is configured differently, u
 2. Verify ESP32 and your computer are on the same network
 3. Try pinging the ESP32: `ping 192.168.1.XXX`
 
-### Large response tests fail
+### Large response tests fail (truncated bodies)
 
-This is expected — it's why this debug app exists! Check:
-1. Serial log for crash traces or OOM errors
-2. Memory stats before/after via `/api/memory`
-3. Try reducing `chunk_size` or increasing timeout
+Large concurrent responses (e.g. 64 KB) truncating mid-body used to be common —
+the root cause was lwIP send-buffer backpressure being treated as a fatal error.
+`tcp_server:do_send/3` now retries on backpressure, which eliminates the vast
+majority of these (verified ~65% → ~0% on a single 64 KB response). If you still
+see truncations:
+1. Confirm you're on a build that includes the `do_send` retry (current `src/`).
+2. Check `/api/memory` — a healthy heap with truncation points to lwIP buffer
+   pressure under very high concurrency (run the soak to characterize it).
+3. Serial log for crash traces or OOM errors.
 
 ## Files
 
 ```
 examples/httpd_debug/
 ├── mix.exs                                 # ExAtomVM project config
+├── SOAK.md                                 # Endurance/soak testing guide
 ├── lib/
-│   ├── httpd_debug.ex                      # Entrypoint, starts WiFi + HTTPD
+│   ├── httpd_debug.ex                      # Entrypoint: WiFi + HTTPD, self-healing retry loop
 │   └── httpd_debug/
-│       ├── wifi.ex                         # WiFi STA with callbacks
+│       ├── wifi.ex                         # WiFi STA (patient connect, no halt-on-failure)
 │       └── debug_api_handler.ex            # Debug/test API endpoints
 ├── priv/
 │   └── index.html                          # Browser test dashboard
 └── scripts/
     ├── flash.sh                            # Build and flash to ESP32
     ├── monitor.sh                          # Serial monitor with logging
-    └── test.sh                             # Automated curl test suite
+    ├── test.sh                             # Automated curl test suite (size sweeps)
+    ├── soak.sh                             # Unattended endurance/soak runner (CSV + heap sampling)
+    └── soak_analyze.sh                     # Post-process a soak run into a leak/fail verdict
 ```
 
 ## License

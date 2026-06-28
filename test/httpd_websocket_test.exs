@@ -22,19 +22,31 @@ defmodule HttpdWebsocketTest do
     port = find_free_tcp_port()
 
     config = [
-      {[<<"ws">>], %{handler: :httpd_ws_handler, handler_config: %{module: TestWebSocketHandler, args: self()}}}
+      {[<<"ws">>],
+       %{
+         handler: :httpd_ws_handler,
+         handler_config: %{module: TestWebSocketHandler, args: self()}
+       }}
     ]
 
     {:ok, server} = :httpd.start_link(port, config)
     Process.sleep(20)
 
-    on_exit(fn ->
-      if Process.alive?(server) do
-        :httpd.stop(server)
-      end
-    end)
+    on_exit(fn -> safe_stop(server) end)
 
     {:ok, port: port}
+  end
+
+  # The server is linked to the test process and traps exits, so it shuts down as
+  # the test process exits — racing on_exit's stop. Tolerate an already-gone server.
+  defp safe_stop(server) do
+    if Process.alive?(server) do
+      try do
+        :httpd.stop(server)
+      catch
+        :exit, _ -> :ok
+      end
+    end
   end
 
   test "completes websocket handshake", %{port: port} do
@@ -185,6 +197,7 @@ defmodule HttpdWebsocketTest do
 
     # Consume entire handshake response (read until we get \r\n\r\n)
     handshake = read_http_response(socket)
+
     unless handshake =~ "101 Switching Protocols" do
       raise "Failed to establish WebSocket connection: #{inspect(handshake)}"
     end
@@ -203,11 +216,13 @@ defmodule HttpdWebsocketTest do
     case :gen_tcp.recv(socket, 0, @receive_timeout) do
       {:ok, data} ->
         new_acc = <<acc::binary, data::binary>>
+
         if :binary.match(new_acc, <<"\r\n\r\n">>) != :nomatch do
           new_acc
         else
           read_http_response(socket, new_acc)
         end
+
       {:error, reason} ->
         raise "Failed to read HTTP response: #{inspect(reason)}"
     end
@@ -313,6 +328,7 @@ defmodule HttpdWebsocketTest do
         case has_complete_frame?(new_acc) do
           {:complete, _total_size} ->
             {:ok, new_acc}
+
           :incomplete ->
             recv_all_ws_frame(socket, new_acc)
         end
@@ -326,6 +342,7 @@ defmodule HttpdWebsocketTest do
   end
 
   defp has_complete_frame?(data) when byte_size(data) < 2, do: :incomplete
+
   defp has_complete_frame?(data) do
     <<_fin_opcode, mask_len, rest::binary>> = data
     payload_len_indicator = band(mask_len, 0x7F)

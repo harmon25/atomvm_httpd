@@ -1,6 +1,6 @@
-defmodule HttpdDebug.WiFi do
+defmodule TcpEcho.WiFi do
   @moduledoc """
-  WiFi STA connectivity for HttpdDebug.
+  WiFi STA connectivity for TcpEcho.
 
   Reads WiFi credentials from compile-time environment variables
   and establishes a connection to the configured access point.
@@ -11,10 +11,6 @@ defmodule HttpdDebug.WiFi do
   @wifi_ssid System.get_env("ATOMVM_WIFI_SSID")
   @wifi_psk System.get_env("ATOMVM_WIFI_PSK")
   @connect_timeout 15_000
-  # Number of @connect_timeout cycles to wait for an IP before giving up.
-  # The first association after boot is frequently flaky (one STA_DISCONNECTED
-  # before it sticks), so be patient rather than bailing on the first hiccup.
-  @max_wait_cycles 8
 
   def connect do
     unless @wifi_ssid do
@@ -44,11 +40,7 @@ defmodule HttpdDebug.WiFi do
     case :network.start(network_config) do
       {:ok, _pid} ->
         IO.puts("WiFi: Network driver started")
-        wait_for_ip(@max_wait_cycles)
-
-      # On a reconnect attempt the driver is already running; just wait for IP.
-      {:error, {:already_started, _pid}} ->
-        wait_for_ip(@max_wait_cycles)
+        wait_for_ip()
 
       {:error, reason} ->
         IO.puts("WiFi: Failed to start network driver: #{inspect(reason)}")
@@ -60,29 +52,23 @@ defmodule HttpdDebug.WiFi do
   defp maybe_add_psk(config, ""), do: config
   defp maybe_add_psk(config, psk), do: Keyword.put(config, :psk, psk)
 
-  defp wait_for_ip(0) do
-    IO.puts("WiFi: Gave up waiting for IP address")
-    {:error, :timeout}
-  end
-
-  defp wait_for_ip(cycles) do
+  defp wait_for_ip do
     receive do
       {:wifi_connected} ->
         IO.puts("WiFi: Connected to AP")
-        # Got association — reset patience while we wait for DHCP.
-        wait_for_ip(@max_wait_cycles)
+        wait_for_ip()
 
       {:wifi_disconnected} ->
-        IO.puts("WiFi: Disconnected from AP, waiting for reconnect...")
-        wait_for_ip(cycles)
+        IO.puts("WiFi: Disconnected from AP")
+        wait_for_ip()
 
       {:wifi_got_ip, ip_info} ->
         IO.puts("WiFi: Got IP #{inspect(ip_info)}")
         {:ok, ip_info}
     after
       @connect_timeout ->
-        IO.puts("WiFi: still waiting for IP (#{cycles - 1} cycles left)...")
-        wait_for_ip(cycles - 1)
+        IO.puts("WiFi: Timeout waiting for IP address")
+        {:error, :timeout}
     end
   end
 

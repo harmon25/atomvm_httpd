@@ -18,13 +18,13 @@
 -module(httpd).
 
 -export([start/2, start/3, start/4, start/5, start_link/2, start_link/3, start_link/4, start_link/5, stop/1]).
--export([init/1, handle_receive/3, handle_tcp_closed/2, handle_info/2]).
+-export([init/2, handle_data/2, handle_close/2, handle_timeout/1]).
 
 -ifdef(TEST).
--export([maybe_parse_http_request/1, handle_request_state/3, get_request_state/1]).
+-export([maybe_parse_http_request/1, handle_request_state/2, get_request_state/1]).
 -endif.
 
--behaviour(gen_tcp_server).
+-behaviour(tcp_server).
 -include("httpd.hrl").
 
 % -define(TRACE_ENABLED, true).
@@ -67,12 +67,18 @@
     not_found | bad_request | internal_server_error |
     term().
 
+%% Per-connection state.  Each connection runs in its own tcp_server worker
+%% process, so there is no socket-keyed bookkeeping: every field is for THIS
+%% connection only.
 -record(state, {
+    socket,
     config,
-    pending_request_map = #{},
-    ws_socket_map = #{},
-    pending_buffer_map = #{},
-    pending_timer_map = #{},
+    %% Partially-accumulated HttpRequest awaiting more body bytes, or undefined.
+    pending_request = undefined,
+    %% Buffered header bytes not yet forming a complete request line+headers.
+    buffer = <<>>,
+    %% WebSocket handler gen_server pid once upgraded, or undefined.
+    ws = undefined,
     request_timeout = 30000
 }).
 
@@ -98,7 +104,7 @@ start(Address, Port, SocketOptions, Config) ->
 
 -spec start(Address :: address(), Port :: portnum(), SocketOptions :: map(), Options :: options(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start(Address, Port, SocketOptions, Options, Config) ->
-    gen_tcp_server:start(#{addr => Address, port => Port}, SocketOptions, ?MODULE, {Options, Config}).
+    tcp_server:start(#{addr => Address, port => Port}, with_recv_timeout(SocketOptions, Options), ?MODULE, {Options, Config}).
 
 -spec start_link(Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Port, Config) ->
@@ -114,126 +120,132 @@ start_link(Address, Port, SocketOptions, Config) ->
 
 -spec start_link(Address :: address(), Port :: portnum(), SocketOptions :: map(), Options :: options(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Address, Port, SocketOptions, Options, Config) ->
-    gen_tcp_server:start_link(#{addr => Address, port => Port}, SocketOptions, ?MODULE, {Options, Config}).
+    tcp_server:start_link(#{addr => Address, port => Port}, with_recv_timeout(SocketOptions, Options), ?MODULE, {Options, Config}).
 
 stop(Httpd) ->
-    gen_tcp_server:stop(Httpd).
+    tcp_server:stop(Httpd).
 
-%%
-%% gen_tcp_server implementation
-%%
-
-%% @hidden
-init({Options, Config}) ->
+%% @private
+%% The request timeout is enforced by tcp_server's recv timeout: inject it as
+%% the `recv_timeout' socket option so a stalled (partial) request wakes the
+%% worker via handle_timeout/1.
+with_recv_timeout(SocketOptions, Options) ->
     Timeout = maps:get(request_timeout, Options, 30000),
-    {ok, #state{config = Config, request_timeout = Timeout}};
-init(Config) ->
-    %% Backwards-compatible: called with just Config (no Options).
-    {ok, #state{config = Config}}.
+    SocketOptions#{recv_timeout => Timeout}.
+
+%%
+%% tcp_server implementation
+%%
 
 %% @hidden
-handle_receive(Socket, Packet, State) ->
+init(Socket, {Options, Config}) ->
+    Timeout = maps:get(request_timeout, Options, 30000),
+    {ok, #state{socket = Socket, config = Config, request_timeout = Timeout}};
+init(Socket, Config) ->
+    %% Backwards-compatible: called with just Config (no Options).
+    {ok, #state{socket = Socket, config = Config}}.
+
+%% @hidden
+handle_data(Packet, #state{ws = undefined} = State) ->
     try
-        case maps:get(Socket, State#state.ws_socket_map, undefined) of
-            undefined ->
-                handle_http_request(Socket, Packet, State);
-            WebSocket ->
-                case httpd_ws_handler:handle_web_socket_message(WebSocket, Packet) of
-                    ok ->
-                        {noreply, State};
-                    Error ->
-                        {close, create_error(?INTERNAL_SERVER_ERROR, Error), State}
-                end
-        end
+        handle_http_request(Packet, State)
     catch
         A:E:S ->
             io:format("Caught error: ~p:~p:~p~n", [A, E, S]),
-            {close, create_error(?BAD_REQUEST, E), State}
+            {send_close, create_error(?BAD_REQUEST, E)}
+    end;
+handle_data(Packet, #state{ws = WebSocket} = State) ->
+    case httpd_ws_handler:handle_web_socket_message(WebSocket, Packet) of
+        ok ->
+            {continue, State};
+        Error ->
+            {send_close, create_error(?INTERNAL_SERVER_ERROR, Error)}
     end.
 
 %% @private
-handle_http_request(Socket, Packet, State) ->
-    PendingRequestMap = State#state.pending_request_map,
-    BufferMap = State#state.pending_buffer_map,
-    PendingBuffer = maps:get(Socket, BufferMap, <<>>),
+handle_http_request(Packet, State) ->
+    PendingBuffer = State#state.buffer,
     AccumulatedPacket = <<PendingBuffer/binary, Packet/binary>>,
-    case maps:get(Socket, PendingRequestMap, undefined) of
+    case State#state.pending_request of
         undefined ->
             case maybe_parse_http_request(AccumulatedPacket) of
                 {more, IncompletePacket} ->
-                    NewBufferMap = BufferMap#{Socket => IncompletePacket},
-                    {noreply, start_request_timer(Socket, State#state{pending_buffer_map = NewBufferMap})};
+                    {continue, State#state{buffer = IncompletePacket}};
                 {ok, HttpRequest} ->
-                    CleanBufferMap = maps:remove(Socket, BufferMap),
-                    CleanState = State#state{pending_buffer_map = CleanBufferMap},
-                    % ?TRACE("HttpRequest: ~p~n", [HttpRequest]),
+                    CleanState = State#state{buffer = <<>>},
                     #{
                         method := Method,
                         headers := Headers
                     } = HttpRequest,
                     case Method of
                         undefined ->
-                            {close, create_error(?NOT_ALLOWED, method_not_allowed), CleanState};
+                            {send_close, create_error(?NOT_ALLOWED, method_not_allowed)};
                         _ ->
                             case get_protocol(Method, Headers) of
-                        http ->
-                            case init_handler(HttpRequest, CleanState) of
-                                {ok, {Handler, HandlerState, PathSuffix, HandlerConfig}} ->
-                                    NewHttpRequest = HttpRequest#{
-                                        handler => Handler,
-                                        handler_state => HandlerState,
-                                        path_suffix => PathSuffix,
-                                        handler_config => HandlerConfig,
-                                        socket => Socket
-                                    },
-                                    handle_request_state(Socket, NewHttpRequest, CleanState);
-                                Error ->
-                                    {close, create_error(?INTERNAL_SERVER_ERROR, Error), CleanState}
-                            end;
-                        ws ->
-                            ?TRACE("Protocol is ws", []),
-                            Headers = maps:get(headers, HttpRequest, #{}),
-                            case get_ws_key(Headers) of
-                                {ok, WebSocketKey} ->
-                                    ReplyToken = get_reply_token(WebSocketKey),
-                                    Config = CleanState#state.config,
-                                    Path = maps:get(path, HttpRequest),
-                                    case get_handler(Path, Config) of
-                                        {ok, PathSuffix, EntryConfig} ->
-                                            WsHandler = maps:get(handler, EntryConfig),
-                                            ?TRACE("Got handler ~p", [WsHandler]),
-                                            HandlerConfig = maps:get(handler_config, EntryConfig, #{}),
-                                            case WsHandler:start(Socket, PathSuffix, HandlerConfig) of
-                                                {ok, WebSocket} ->
-                                                    ?TRACE("Started web socket handler: ~p", [WebSocket]),
-                                                    NewWebSocketMap = maps:put(Socket, WebSocket, CleanState#state.ws_socket_map),
-                                                    NewState = CleanState#state{ws_socket_map = NewWebSocketMap},
-                                                    ReplyHeaders = #{"Upgrade" => "websocket", "Connection" => "Upgrade", "Sec-WebSocket-Accept" => ReplyToken},
-                                                    Reply = create_reply(?SWITCHING_PROTOCOLS, ReplyHeaders, <<"">>),
-                                                    ?TRACE("Sending web socket upgrade reply: ~p", [Reply]),
-                                                    {reply, Reply, NewState};
-                                                Error ->
-                                                    ?TRACE("Web socket error: ~p", [Error]),
-                                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error}), CleanState}
-                                            end;
-                                        Error ->
-                                            {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error}), CleanState}
-                                    end;
-                                error ->
-                                    {close, create_error(?BAD_REQUEST, missing_websocket_key), CleanState}
+                                http ->
+                                    handle_http_protocol(HttpRequest, CleanState);
+                                ws ->
+                                    handle_ws_upgrade(HttpRequest, CleanState)
                             end
-                    end
                     end;
                 {error, Reason} ->
-                    {close, create_error(?BAD_REQUEST, Reason), State}
+                    {send_close, create_error(?BAD_REQUEST, Reason)}
             end;
         PendingHttpRequest ->
             ?TRACE("Packetlen: ~p", [erlang:byte_size(Packet)]),
             ExistingBody = maps:get(body, PendingHttpRequest, <<>>),
             NewBody = <<ExistingBody/binary, Packet/binary>>,
-            CleanBufferMap = maps:remove(Socket, BufferMap),
-            CleanState = State#state{pending_buffer_map = CleanBufferMap},
-            handle_request_state(Socket, PendingHttpRequest#{body := NewBody}, CleanState)
+            CleanState = State#state{buffer = <<>>},
+            handle_request_state(PendingHttpRequest#{body := NewBody}, CleanState)
+    end.
+
+%% @private
+handle_http_protocol(HttpRequest, State) ->
+    case init_handler(HttpRequest, State) of
+        {ok, {Handler, HandlerState, PathSuffix, HandlerConfig}} ->
+            NewHttpRequest = HttpRequest#{
+                handler => Handler,
+                handler_state => HandlerState,
+                path_suffix => PathSuffix,
+                handler_config => HandlerConfig,
+                socket => State#state.socket
+            },
+            handle_request_state(NewHttpRequest, State);
+        Error ->
+            {send_close, create_error(?INTERNAL_SERVER_ERROR, Error)}
+    end.
+
+%% @private
+handle_ws_upgrade(HttpRequest, State) ->
+    ?TRACE("Protocol is ws", []),
+    Headers = maps:get(headers, HttpRequest, #{}),
+    case get_ws_key(Headers) of
+        {ok, WebSocketKey} ->
+            ReplyToken = get_reply_token(WebSocketKey),
+            Config = State#state.config,
+            Path = maps:get(path, HttpRequest),
+            case get_handler(Path, Config) of
+                {ok, PathSuffix, EntryConfig} ->
+                    WsHandler = maps:get(handler, EntryConfig),
+                    ?TRACE("Got handler ~p", [WsHandler]),
+                    HandlerConfig = maps:get(handler_config, EntryConfig, #{}),
+                    case WsHandler:start(State#state.socket, PathSuffix, HandlerConfig) of
+                        {ok, WebSocket} ->
+                            ?TRACE("Started web socket handler: ~p", [WebSocket]),
+                            NewState = State#state{ws = WebSocket},
+                            ReplyHeaders = #{"Upgrade" => "websocket", "Connection" => "Upgrade", "Sec-WebSocket-Accept" => ReplyToken},
+                            Reply = create_reply(?SWITCHING_PROTOCOLS, ReplyHeaders, <<"">>),
+                            ?TRACE("Sending web socket upgrade reply: ~p", [Reply]),
+                            {send, Reply, NewState};
+                        Error ->
+                            ?TRACE("Web socket error: ~p", [Error]),
+                            {send_close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                    end;
+                Error ->
+                    {send_close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+            end;
+        error ->
+            {send_close, create_error(?BAD_REQUEST, missing_websocket_key)}
     end.
 
 %% @private
@@ -256,24 +268,19 @@ init_handler(HttpRequest, State) ->
     end.
 
 %% @private
-handle_request_state(Socket, HttpRequest, State) ->
-    PendingRequestMap = State#state.pending_request_map,
+handle_request_state(HttpRequest, State) ->
     case get_request_state(HttpRequest) of
         complete ->
             ?TRACE("Request complete.  Handling...", []),
-            NewPendingRequestMap = maps:remove(Socket, PendingRequestMap),
-            CleanState = stop_request_timer(Socket, State#state{pending_request_map = NewPendingRequestMap}),
-            call_http_req_handler(Socket, HttpRequest, CleanState);
+            call_http_req_handler(HttpRequest, State#state{pending_request = undefined});
         expect_continue ->
             Headers = maps:get(headers, HttpRequest),
             NewHeaders = maps:remove(<<"expect">>, Headers),
             NewHttpRequest = HttpRequest#{headers := NewHeaders},
             Reply = create_reply(?CONTINUE, #{}, <<"">>),
-            NewPendingRequestMap = PendingRequestMap#{Socket => NewHttpRequest},
-            {reply, Reply, start_request_timer(Socket, State#state{pending_request_map = NewPendingRequestMap})};
+            {send, Reply, State#state{pending_request = NewHttpRequest}};
         wait_for_body ->
-            NewPendingRequestMap = PendingRequestMap#{Socket => HttpRequest},
-            {noreply, start_request_timer(Socket, State#state{pending_request_map = NewPendingRequestMap})}
+            {continue, State#state{pending_request = HttpRequest}}
     end.
 
 %% @private
@@ -305,101 +312,68 @@ get_request_state(HttpRequest) ->
     end.
 
 %% @private
-call_http_req_handler(Socket, HttpRequest, State) ->
+call_http_req_handler(HttpRequest, State) ->
     #{
         handler := Handler,
         handler_state := HandlerState
     } = HttpRequest,
     case Handler:handle_http_req(HttpRequest, HandlerState) of
-        %% noreply
+        %% noreply — handler wants more body data for THIS request; keep it
+        %% pending (with the updated handler_state) so the next packet is
+        %% appended to its body rather than parsed as a fresh request.
         {noreply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {noreply, NewState};
-        %% reply — always keeps the socket open (gen_tcp_server treats {reply,...} as keep-open).
-        %% NOTE: HTTP/1.0 default-close and Connection: close semantics are not yet implemented;
-        %% that negotiation is deferred to a follow-up.  Handlers that need to force a close
-        %% should return {close, ...} instead.
-        {reply, Reply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {reply, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply), NewState};
-        {reply, ReplyHeaders, Reply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {reply, create_reply(?OK, ReplyHeaders, Reply), NewState};
+            {continue, State#state{pending_request = HttpRequest#{handler_state := NewHandlerState}}};
+        %% reply — send the response and keep the connection open for the next
+        %% request (keep-alive).  pending_request is cleared so the next packet
+        %% is parsed fresh.
+        %% NOTE: HTTP/1.0 default-close and Connection: close semantics are not yet
+        %% implemented; that negotiation is deferred to a follow-up.  Handlers that
+        %% need to force a close should return {close, ...} instead.
+        {reply, Reply, _NewHandlerState} ->
+            {send, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply),
+                State#state{pending_request = undefined}};
+        {reply, ReplyHeaders, Reply, _NewHandlerState} ->
+            {send, create_reply(?OK, ReplyHeaders, Reply), State#state{pending_request = undefined}};
         %% close — handler explicitly requests connection close; always honour it
         %% regardless of the client's keep-alive preference, preserving the documented
         %% httpd_handler contract that {close, ...} means "send response, close connection".
         close ->
             {close, State};
         {close, Reply} ->
-            ReplyPacket = create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply),
-            {close, ReplyPacket, State};
+            {send_close, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply)};
         {close, ReplyHeaders, Reply} ->
-            ReplyPacket = create_reply(?OK, ReplyHeaders, Reply),
-            {close, ReplyPacket, State};
+            {send_close, create_reply(?OK, ReplyHeaders, Reply)};
         %% errors
         {error, not_found} ->
-            {close, create_error(?NOT_FOUND, not_found), State};
+            {send_close, create_error(?NOT_FOUND, not_found)};
         {error, bad_request} ->
-            {close, create_error(?BAD_REQUEST, bad_request), State};
+            {send_close, create_error(?BAD_REQUEST, bad_request)};
         {error, internal_server_error} ->
-            {close, create_error(?INTERNAL_SERVER_ERROR, internal_server_error), State};
+            {send_close, create_error(?INTERNAL_SERVER_ERROR, internal_server_error)};
         HandlerError ->
-            {close, create_error(?INTERNAL_SERVER_ERROR, HandlerError), State}
-    end.
-
-%% @private
-update_state(Socket, HttpRequest, HandlerState, State) ->
-    NewHttpRequest = HttpRequest#{handler_state := HandlerState},
-    PendingRequestMap = State#state.pending_request_map,
-    NewPendingRequestMap = PendingRequestMap#{Socket => NewHttpRequest},
-    State#state{pending_request_map = NewPendingRequestMap}.
-
-
-%% @hidden
-handle_tcp_closed(Socket, State) ->
-    %% Cancel any pending request timer so it cannot fire after the socket is gone
-    %% and deliver a stale {request_timeout, Socket} message that might accidentally
-    %% close a future connection reusing the same socket term.
-    TimerCancelledState = stop_request_timer(Socket, State),
-    NewPendingRequestMap = maps:remove(Socket, TimerCancelledState#state.pending_request_map),
-    NewPendingBufferMap = maps:remove(Socket, TimerCancelledState#state.pending_buffer_map),
-    CleanState = TimerCancelledState#state{
-        pending_request_map = NewPendingRequestMap,
-        pending_buffer_map = NewPendingBufferMap
-    },
-    case maps:get(Socket, CleanState#state.ws_socket_map, undefined) of
-        undefined ->
-            CleanState;
-        WebSocket ->
-            ok = httpd_ws_handler:stop(WebSocket),
-            NewWebSocketMap = maps:remove(Socket, CleanState#state.ws_socket_map),
-            CleanState#state{ws_socket_map = NewWebSocketMap}
+            {send_close, create_error(?INTERNAL_SERVER_ERROR, HandlerError)}
     end.
 
 %% @hidden
-%% Validate timer-tagged request timeout messages.  Using the TimerRef in the
-%% message tag makes this race-free: if stop_request_timer/2 cancelled the
-%% timer before the message was delivered, the ref will no longer be in
-%% pending_timer_map and we ignore the stale message; if the timer fired first,
-%% the ref matches and we correctly close the socket.
-handle_info({request_timeout, Socket, Tag}, State) ->
-    TimerMap = State#state.pending_timer_map,
-    case maps:get(Socket, TimerMap, undefined) of
-        {_TimerRef, Tag} ->
-            %% Tag matches the current timer — the request genuinely timed out.
-            ?TRACE("Request timeout confirmed for socket ~p (tag ~p)", [Socket, Tag]),
-            NewTimerMap = maps:remove(Socket, TimerMap),
-            NewState = State#state{pending_timer_map = NewTimerMap},
-            {close, Socket, NewState};
-        _ ->
-            %% Tag does not match: timer was cancelled and a new one installed
-            %% (keep-alive), or the entry was already removed (request completed).
-            %% Ignore the stale message.
-            ?TRACE("Ignoring stale request_timeout for socket ~p (tag ~p)", [Socket, Tag]),
-            {noreply, State}
-    end;
-handle_info(_Msg, State) ->
-    {noreply, State}.
+handle_close(_Reason, #state{ws = undefined}) ->
+    ok;
+handle_close(_Reason, #state{ws = WebSocket}) ->
+    %% Stop the WebSocket handler gen_server; it may already be gone if it
+    %% closed the socket itself, so guard against a noproc exit.
+    catch httpd_ws_handler:stop(WebSocket),
+    ok.
+
+%% @hidden
+%% Invoked by tcp_server when a blocking recv hits the request_timeout with no
+%% data.  If a request is in flight (partial headers buffered, or a body still
+%% being received) the client has stalled — close.  Otherwise the connection is
+%% simply idle (e.g. keep-alive between requests, or an established WebSocket) —
+%% keep waiting.
+handle_timeout(#state{pending_request = undefined, buffer = <<>>} = State) ->
+    {continue, State};
+handle_timeout(State) ->
+    ?TRACE("Request timeout — closing stalled connection", []),
+    {close, State}.
 
 %%
 %% Internal functions
@@ -770,33 +744,4 @@ method_to_atom("DELETE") ->
 method_to_atom(_) ->
     undefined.
 
-%% @private
-%% Each timer entry is stored as {TimerRef, Tag} where Tag = make_ref().
-%% Tag is embedded in the {request_timeout, Socket, Tag} message so that
-%% handle_info/2 can compare it against the current map entry and safely
-%% ignore any stale messages that arrive after cancel_timer/1 was called
-%% (they carry an old Tag that no longer matches).  This makes the timeout
-%% handling race-free without needing a receive-flush.
-start_request_timer(Socket, State) ->
-    Timeout = State#state.request_timeout,
-    TimerMap = State#state.pending_timer_map,
-    %% Cancel any pre-existing timer for this socket.
-    case maps:get(Socket, TimerMap, undefined) of
-        undefined -> ok;
-        {OldRef, _OldTag} -> erlang:cancel_timer(OldRef)
-    end,
-    Tag = make_ref(),
-    TimerRef = erlang:send_after(Timeout, self(), {request_timeout, Socket, Tag}),
-    State#state{pending_timer_map = TimerMap#{Socket => {TimerRef, Tag}}}.
 
-%% @private
-stop_request_timer(Socket, State) ->
-    TimerMap = State#state.pending_timer_map,
-    %% Cancel the timer.  Any {request_timeout, Socket, Tag} already in the
-    %% mailbox carries the old Tag; handle_info/2 will ignore it because we
-    %% remove the entry from pending_timer_map here — no receive-flush needed.
-    case maps:get(Socket, TimerMap, undefined) of
-        undefined -> ok;
-        {Ref, _Tag} -> erlang:cancel_timer(Ref)
-    end,
-    State#state{pending_timer_map = maps:remove(Socket, TimerMap)}.

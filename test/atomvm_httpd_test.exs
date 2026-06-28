@@ -29,25 +29,17 @@ defmodule HttpdUnitTest do
   test "handle_request_state stores partial body until complete" do
     socket = make_ref()
     http_request = %{headers: %{<<"content-length">> => <<"5">>}, body: <<"12">>}
-    state = {:state, [], %{}, %{}, %{}, %{}, 30000}
 
-    assert {:noreply, result_state} = :httpd.handle_request_state(socket, http_request, state)
+    # Per-connection state record:
+    # {state, socket, config, pending_request, buffer, ws, request_timeout}
+    state = {:state, socket, [], :undefined, <<>>, :undefined, 30000}
 
-    # Destructure the result state tuple: {state, config, pending_request_map,
-    # ws_socket_map, pending_buffer_map, pending_timer_map, request_timeout}
-    {:state, _config, pending_request_map, _ws, _buf, pending_timer_map, _timeout} = result_state
+    assert {:continue, result_state} = :httpd.handle_request_state(http_request, state)
 
-    # Partial request should be stored in the pending map
-    assert %{^socket => ^http_request} = pending_request_map
+    {:state, _socket, _config, pending_request, _buffer, _ws, _timeout} = result_state
 
-    # A request timer should have been started for the socket.
-    # The entry is {TimerRef, Tag} — both are opaque references.
-    timer_entry = Map.get(pending_timer_map, socket)
-    assert is_tuple(timer_entry) and tuple_size(timer_entry) == 2,
-           "expected a {timer_ref, tag} tuple in pending_timer_map for the socket"
-    {t_ref, t_tag} = timer_entry
-    assert is_reference(t_ref)
-    assert is_reference(t_tag)
+    # The incomplete request should be retained as the connection's pending request.
+    assert pending_request == http_request
 
     assert :wait_for_body = :httpd.get_request_state(http_request)
   end

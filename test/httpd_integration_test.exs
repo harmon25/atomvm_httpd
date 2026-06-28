@@ -24,13 +24,22 @@ defmodule HttpdIntegrationTest do
     {:ok, server} = :httpd.start_link(port, config)
     Process.sleep(20)
 
-    on_exit(fn ->
-      if Process.alive?(server) do
-        :httpd.stop(server)
-      end
-    end)
+    on_exit(fn -> safe_stop(server) end)
 
     {:ok, port: port}
+  end
+
+  # The server is linked to the test process (start_link) and traps exits, so it
+  # shuts down as the test process exits — racing on_exit's stop. Tolerate a
+  # server that is already gone.
+  defp safe_stop(server) do
+    if Process.alive?(server) do
+      try do
+        :httpd.stop(server)
+      catch
+        :exit, _ -> :ok
+      end
+    end
   end
 
   test "reassembles POST bodies across tcp frames", %{port: port} do
@@ -140,6 +149,7 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
+
       assert String.contains?(headers, "content-length: #{expected_length}"),
              "Expected content-length: #{expected_length}"
 
@@ -169,6 +179,7 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
+
       assert String.contains?(headers, "content-length: #{expected_length}"),
              "Expected content-length: #{expected_length}"
 
@@ -198,6 +209,7 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
+
       assert String.contains?(headers, "content-length: #{expected_length}"),
              "Expected content-length: #{expected_length}"
 
@@ -227,6 +239,7 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
+
       assert String.contains?(headers, "content-length: #{expected_length}"),
              "Expected content-length: #{expected_length}"
 
@@ -256,6 +269,7 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
+
       assert String.contains?(headers, "content-length: #{expected_length}"),
              "Expected content-length: #{expected_length}"
 
@@ -285,6 +299,7 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
+
       assert String.contains?(headers, "content-length: #{expected_length}"),
              "Expected content-length: #{expected_length}"
 
@@ -315,7 +330,7 @@ defmodule HttpdIntegrationTest do
       Process.sleep(20)
 
       on_exit(fn ->
-        if Process.alive?(server), do: :httpd.stop(server)
+        safe_stop(server)
       end)
 
       {:ok, port: port}
@@ -398,7 +413,7 @@ defmodule HttpdIntegrationTest do
       Process.sleep(20)
 
       on_exit(fn ->
-        if Process.alive?(server), do: :httpd.stop(server)
+        safe_stop(server)
       end)
 
       {:ok, port: port}
@@ -429,6 +444,87 @@ defmodule HttpdIntegrationTest do
       Process.sleep(@timeout_ms + 200)
       assert {:error, :closed} = :gen_tcp.recv(socket, 0, 500)
       :gen_tcp.close(socket)
+    end
+  end
+
+  describe "concurrent connections" do
+    # A large response so that, under the old single-gen_server design, serving
+    # it would block other connections. With per-connection worker processes,
+    # small requests on other connections must stay responsive.
+    @big_body :binary.copy("y", 262_144)
+
+    setup do
+      port = find_free_tcp_port()
+
+      config = [
+        {[<<"big">>],
+         %{
+           handler: TestEchoHandler,
+           handler_config: %{
+             reply_body: @big_body,
+             reply_headers: %{"Content-Type" => "text/plain"}
+           }
+         }},
+        {[], %{handler: TestEchoHandler, handler_config: %{reply_body: "small"}}}
+      ]
+
+      # Tiny chunk_size so the big response takes many send iterations.
+      {:ok, server} = :httpd.start_link(:any, port, %{chunk_size: 256}, config)
+      Process.sleep(20)
+      on_exit(fn -> safe_stop(server) end)
+      {:ok, port: port}
+    end
+
+    test "multiple connections are served independently", %{port: port} do
+      tasks =
+        for _ <- 1..5 do
+          Task.async(fn ->
+            {:ok, socket} = connect(port)
+            :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            result = recv_all(socket)
+            :gen_tcp.close(socket)
+            result
+          end)
+        end
+
+      for result <- Task.await_many(tasks, 5_000) do
+        assert {:ok, response} = result
+        assert response =~ "HTTP/1.1 200 OK"
+        [_headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+        assert body == "small"
+      end
+    end
+
+    test "a large response does not block small ones", %{port: port} do
+      # Kick off a 256KB download on one connection.
+      big_task =
+        Task.async(fn ->
+          {:ok, socket} = connect(port)
+          :ok = :gen_tcp.send(socket, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+          result = recv_all(socket)
+          :gen_tcp.close(socket)
+          result
+        end)
+
+      # While it's streaming, small requests on independent connections must
+      # complete quickly.
+      for _ <- 1..5 do
+        {elapsed_us, _} =
+          :timer.tc(fn ->
+            {:ok, socket} = connect(port)
+            :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            assert {:ok, response} = recv_all(socket)
+            assert response =~ "HTTP/1.1 200 OK"
+            :gen_tcp.close(socket)
+          end)
+
+        assert elapsed_us < 1_000_000,
+               "small request took #{elapsed_us}us while large response was streaming"
+      end
+
+      assert {:ok, big_response} = Task.await(big_task, 10_000)
+      [_headers, big_body] = :binary.split(big_response, <<"\r\n\r\n">>)
+      assert byte_size(big_body) == byte_size(@big_body)
     end
   end
 

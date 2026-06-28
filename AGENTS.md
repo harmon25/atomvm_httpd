@@ -7,20 +7,22 @@ thin Elixir convenience wrapper. Built with Mix.
 ## Architecture
 
 ```
-gen_tcp_server.erl  →  httpd.erl            →  Handler modules
+tcp_server.erl      →  httpd.erl            →  Handler modules
 (TCP/socket layer)     (HTTP/1.1 parse,         (request processing)
                         routing, send)
 ```
 
-- **`gen_tcp_server`**: generic TCP server behavior wrapping AtomVM `socket`.
-  Implementers provide `init/1`, `handle_receive/3`, `handle_tcp_closed/2`
-  (optional `handle_info/2`). A single gen_server owns the listen socket AND all
-  handler state; per-connection processes only own `recv` and forward data to it.
-  Parsing, dispatch, and the chunked `send` all run in that one gen_server — so
-  responses are serialized across connections (known throughput bottleneck for
-  large/parallel responses).
+- **`tcp_server`**: generic per-connection-process TCP server wrapping AtomVM
+  `socket`. A listener gen_server owns the listen socket and spawns/monitors one
+  worker process per connection; an acceptor process runs a pure `socket:accept`
+  loop. Each worker owns its socket for the whole lifecycle: `recv →
+  Protocol:handle_data → chunked send`, all in that worker. Connections are
+  therefore independent — a large/slow response on one never blocks another.
+  Behavior callbacks: `init/2`, `handle_data/2`, `handle_close/2` (optional
+  `handle_info/2`, `handle_timeout/1`). See "tcp_server behavior" below.
 - **`httpd`**: HTTP/1.1 protocol + path-prefix routing; implements the
-  `gen_tcp_server` behavior.
+  `tcp_server` behavior. State is **per-connection** (no socket-keyed maps): each
+  worker holds its own `pending_request`, `buffer`, and `ws` handler pid.
 - **Handler behaviors**:
   - `httpd_handler` — low-level HTTP (`init_handler/2`, `handle_http_req/2`)
   - `httpd_api_handler` — REST/JSON (`handle_api_request/4`)
@@ -34,6 +36,25 @@ gen_tcp_server.erl  →  httpd.erl            →  Handler modules
 {noreply, State}                %% keep accumulating request (streaming)
 {error, not_found | bad_request | internal_server_error}
 ```
+
+### tcp_server behavior
+
+Generic per-connection TCP server. A protocol module implements:
+
+```erlang
+init(Socket, Args)        -> {ok, State} | {error, Reason}    %% in the worker
+handle_data(Data, State)  -> {send, Resp, State} | {send_close, Resp}
+                           | {continue, State} | {close, State} | {error, Reason}
+handle_close(Reason, State) -> ok
+handle_info(Msg, State)     -> {ok, State} | {send, Resp, State} | {close, State}   %% optional
+handle_timeout(State)       -> {continue, State} | {close, State}                   %% optional
+```
+
+`handle_timeout/1` fires when a blocking recv hits the `recv_timeout` socket
+option (httpd maps `request_timeout` → `recv_timeout` to close stalled
+requests). Out-of-band sends from another process go straight to the socket
+(`tcp_server:send/3` or `socket:send`), as the WebSocket handler does. See
+`examples/tcp_echo/` for a standalone protocol example.
 
 ### Path-based routing
 
@@ -71,14 +92,27 @@ handle_api_request(_M, _P, _R, _A) ->
 
 - **AtomVM `socket` setopt is an allow-list**: only `{socket, reuseaddr|linger|type}`,
   `{otp, recvbuf}`, `{ip, add_membership}` are supported — **no `{tcp, nodelay}`**.
-  `gen_tcp_server:set_socket_options/2` uses strict `ok = socket:setopt(...)`, so an
+  `tcp_server:set_socket_options/2` uses strict `ok = socket:setopt(...)`, so an
   unsupported key **crashes the server at startup**.
-- **App-level keys are not socket options**: `max_connections` and `chunk_size` ride in
-  the same `SocketOptions` map but are stripped via `maps:without/2` in `init/1` before the
-  setopt fold. Add any new app-level key to that strip list.
-- `socket:send/2` returns `ok | {ok, Rest} | {error, Reason}`; partial sends must be retried
-  (see `try_send_binary/3`).
-- Responses are sent in `chunk_size` slices (default 4096; configurable per server).
+- **App-level keys are not socket options**: `max_connections`, `chunk_size`, and
+  `recv_timeout` ride in the same `SocketOptions` map but are stripped with **nested
+  `maps:remove/2`** in `tcp_server:init/1` before the setopt fold. Add any new app-level
+  key to that strip chain.
+- **AtomVM `maps` has no `maps:without/2`** — using it crashes with `undef` at runtime
+  (only surfaces on hardware, not host OTP). Strip keys with chained `maps:remove/2`.
+  Likewise **`erlang:halt/1` is not implemented** (use `halt/0` or just idle).
+- `socket:send/2` returns `ok | {ok, Rest} | {error, Reason}`. Two backpressure cases must
+  both be handled in `tcp_server:do_send/3`:
+  - `{ok, Rest}` — explicit partial send; resend the remainder.
+  - `{error, Reason}` (commonly `{error, closed}`) — on ESP32 the **small lwIP send buffer**
+    (~`4 × TCP_MSS`, a few KB) surfaces backpressure as a *transient error* even though the
+    connection is alive. `do_send` **retries the chunk** with a short backoff (bounded by
+    `MAX_SEND_RETRIES`) instead of treating it as fatal. Without this, large responses
+    (e.g. 64 KB) truncate mid-body a large fraction of the time under concurrency — verified
+    on hardware (~65% → ~0% with retry). A genuinely-dead connection keeps failing and is
+    given up after the bounded budget.
+- Responses are sent in `chunk_size` slices (default 4096; configurable per server). lwIP
+  accepts at most `TCP_MSS` (~1440 B) per `socket:send`, so larger chunks just loop internally.
 - No `priv/` in this repo; `httpd_file_handler` serves from a *consumer* app's `priv`.
 
 ## Testing
@@ -161,6 +195,19 @@ grep -i "error\|crash\|abort" /tmp/atomvm_serial.log
 - **Command API** (`/api/cmd/restart`): Restart ESP32 over HTTP.
 - **Browser dashboard** (`/`): Interactive UI for triggering tests, viewing results, monitoring memory.
 - **Automated test suite** (`scripts/test.sh`): Sweeps response sizes (100B → 64KB) and upload sizes (100B → 16KB), reports pass/fail + timing.
+- **Endurance/soak test** (`scripts/soak.sh <ip> [-d secs] [-c workers] [-o dir]`): Runs a
+  mixed request load (ping/generate/echo) with N concurrent workers for an extended
+  duration (default 1h), sampling device heap every interval to catch leaks/fragmentation,
+  and aborting on a run of consecutive failures (crash/hang) or sustained unreachability.
+  Writes a persistent run dir with `samples.csv` (time-series), `soak.log`, `failures.log`,
+  a live `status` heartbeat, and `summary.txt`. Built for unattended multi-hour/day runs
+  (`nohup`/`tmux`). Validates **complete** response bodies, so truncated/partial sends are
+  counted as failures.
+- **Soak analyzer** (`scripts/soak_analyze.sh <run-dir-or-csv>`): Post-processes a run's
+  `samples.csv` into a verdict — fail rate, throughput, heap **leak estimate** (linear
+  regression slope in B/hour), fragmentation %, low-water, and the worst failure intervals.
+- **Full soak docs**: `examples/httpd_debug/SOAK.md` (running long runs, watching live,
+  interpreting leak/fragmentation/failure signals, plotting).
 
 ### Tuning parameters
 

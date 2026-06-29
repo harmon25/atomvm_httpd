@@ -40,9 +40,10 @@ At a high level, this server supports the following features:
   - Support for payloads up to 64-bit length (gigabytes)
   - Bidirectional messaging (client↔server)
   - Server-initiated push messages
+- **Per-connection process model** — each connection runs in its own worker process that owns its socket end-to-end, so a large/slow response never blocks other connections (see Architecture)
 - **ESP32-optimized networking**
   - Configurable socket options (`SO_REUSEADDR`, buffer sizes, etc.)
-  - 1460-byte send chunking for lwIP compatibility
+  - Configurable send chunking (default 4096 bytes) with backpressure retry for lwIP's small send buffer
   - Incremental I/O list processing to minimize heap pressure
 
 The HTTPd server is designed around a callback architecture, whereby users implement behaviors to handle various requests into the HTTP server. This architecture allows developers to focus on the logic of their applications, as opposed to the nitty gritty details of the HTTP protocol, while still providing access to contextual information about the request, including:
@@ -60,6 +61,63 @@ In addition to the `httpd` server and its associated callbacks, this project als
 - HTTP WebSocket handler -- This handler allows users to send and receive data over the WebSocket protocol.
 
 > Note. The `httpd` server does not currently support TLS communication, so all HTTP requests and responses will be sent in the clear. Use this program at your own risk, and only on a network you can trust.
+
+## Architecture
+
+The server is built in three layers:
+
+```
+tcp_server.erl   →   httpd.erl                →   Handler modules
+(TCP/socket layer)   (HTTP/1.1 parse, routing,    (httpd_file_handler,
+                      response framing & send)     httpd_api_handler,
+                                                   httpd_ws_handler, ...)
+```
+
+### Per-connection processes
+
+`tcp_server` is a generic, per-connection-process TCP server that wraps AtomVM's
+`socket` API. A single listener `gen_server` owns the listen socket and
+spawns/monitors **one worker process per connection**; a dedicated acceptor
+process runs a pure `socket:accept` loop so a protocol crash can never take down
+the accept path. Each worker owns its socket for the connection's entire
+lifecycle and runs the full cycle itself:
+
+```
+recv  →  Protocol:handle_data  →  chunked send  →  loop
+```
+
+`httpd` implements the `tcp_server` behavior, so all HTTP parsing, routing, and
+sending happen **inside the connection's own worker**. State is therefore
+per-connection (no socket-keyed maps): each worker holds its own pending request,
+buffer, and WebSocket handler.
+
+**Why this design.** Connections are fully independent — a large or slow response
+on one connection never blocks another. An earlier design serialized all parsing
+and sending through one `gen_server`, where a single 16 KB chunked response could
+stall every other connection for tens of milliseconds. The per-connection model
+removes that head-of-line blocking entirely, which matters on ESP32 where lwIP
+caps concurrent sockets at a small number and responses are streamed slowly over
+WiFi.
+
+### Chunked sending with backpressure retry
+
+Responses are sent in `chunk_size` slices (default 4096 bytes) via
+`tcp_server:do_send/3`, which runs in the worker so blocking is fine. On ESP32 the
+lwIP TCP **send buffer is small** (a few KB — roughly `4 × TCP_MSS`), so a single
+large response is many times the buffer size and must be paced:
+
+- `socket:send/2` returns `ok` (fully buffered), `{ok, Rest}` (partial — buffer
+  full), or `{error, Reason}`.
+- When the send buffer fills under load, lwIP surfaces the backpressure as a
+  **transient error** (commonly `{error, closed}`) even though the connection is
+  still alive. Treating that as fatal truncates the response mid-body.
+- `do_send` therefore **retries a failed chunk** with a short backoff (bounded —
+  see `MAX_SEND_RETRIES`), only abandoning the response once retries are
+  exhausted. A genuinely-dead connection keeps failing and is given up cleanly.
+
+This retry is the difference between large responses (e.g. 64 KB) truncating a
+large fraction of the time under concurrency versus completing reliably. Tune
+`chunk_size` to your platform's send-buffer headroom (see Socket Options).
 
 # Programming Manual
 
@@ -100,11 +158,11 @@ The `httpd` module provides the following type definitions, which are useful in 
         body := binary(),
         socket := term()
     }.
-    -type handler_config() :: #{
-        module := module(),
-        module_config := term()
+    -type route() :: #{
+        handler := module(),          %% the handler behaviour module
+        handler_config := term()      %% handler-specific config (shape varies per handler)
     }.
-    -type config() :: [{path(), handler_config()}].
+    -type config() :: [{path(), route()}].
     -type portnum() :: 0..65536.
 
 ## Lifecycle
@@ -119,18 +177,27 @@ To start an instance of the HTTPd server, use the `httpd:start_link/2` function,
 
 If successful, the HTTPd server should be listening on the specified port for client connections.
 
+`httpd:start_link` (and the non-linking `httpd:start`) come in several arities. The first argument is the bind `Address` (`any`, `loopback`, or an IP tuple); the optional `SocketOptions` and `Options` maps default to empty:
+
+    %% erlang
+    start_link(Port, Config)
+    start_link(Address, Port, Config)
+    start_link(Address, Port, SocketOptions, Config)
+    start_link(Address, Port, SocketOptions, Options, Config)   %% Options e.g. #{request_timeout => 30000}
+
 ### Socket Options
 
-You can customize low-level socket behavior by providing socket options as the third parameter:
+You can customize low-level socket behavior by passing a `SocketOptions` map. Note this requires the 4-arity form, so an `Address` is given explicitly (use `any` to bind all interfaces):
 
     %% erlang - with custom socket options
+    Address = any,
     Port = 8080,
     SocketOptions = #{
         {socket, reuseaddr} => true,    %% Allow immediate port reuse (default: true)
         {otp, recvbuf} => 8192          %% Set receive buffer size
     },
     Config = ...
-    {ok, Httpd} = httpd:start_link(Port, SocketOptions, Config),
+    {ok, Httpd} = httpd:start_link(Address, Port, SocketOptions, Config),
     ...
 
 Supported socket options (per AtomVM's `socket` module):
@@ -138,6 +205,11 @@ Supported socket options (per AtomVM's `socket` module):
 - `{socket, linger}` - `#{onoff => boolean(), linger => non_neg_integer()}` - Control connection close behavior
 - `{otp, recvbuf}` - `non_neg_integer()` - Receive buffer size in bytes
 - `{ip, add_membership}` - Multicast group membership (advanced)
+
+The following keys are handled by `tcp_server` itself and are **not** passed to `socket:setopt`:
+- `max_connections` - `non_neg_integer()` - Maximum concurrent connections (0 = unlimited, default)
+- `chunk_size` - `pos_integer()` - Maximum bytes per `socket:send/2` call (default: `4096`). Tune this to match your platform's lwIP send-buffer headroom. A 100 KB JPEG at 4096 bytes/chunk requires ~25 send calls; at 1460 bytes it required ~70. ESP32's lwIP send buffer is small (a few KB, roughly `4 × TCP_MSS`), so any response larger than that is streamed across many `socket:send` calls; `do_send` retries on send-buffer backpressure so large responses complete intact (see Architecture → "Chunked sending with backpressure retry"). Values in the 2048–4096 range are a good default; very large chunks offer no benefit since lwIP accepts at most `TCP_MSS` per call.
+- `recv_timeout` - `pos_integer() | infinity` - Per-connection blocking-recv timeout in ms. `httpd` sets this from its `request_timeout` option so stalled/partial requests are closed.
 
 The default configuration enables `SO_REUSEADDR` which is particularly useful on ESP32 for quick restarts during development.
 
@@ -550,9 +622,19 @@ TODO
         internal_server_error |
         term().
 
-# `httpd_example` Example
+# Examples
 
-The `httpd_example` example program illustrates a simple web server. See the [README](./examples/httpd_example/README.md) for information about how to build, flash, and run this example program.
+Two runnable example applications live under [`examples/`](./examples):
+
+- **[`examples/httpd_debug`](./examples/httpd_debug)** — a full debug/stress-test
+  HTTP application for ESP32: WiFi STA, debug + stats API endpoints, a browser
+  dashboard, a curl-based test suite, and an unattended endurance/soak harness
+  (see its [README](./examples/httpd_debug/README.md) and
+  [SOAK.md](./examples/httpd_debug/SOAK.md)). This is the best starting point for
+  exercising the server on real hardware.
+- **[`examples/tcp_echo`](./examples/tcp_echo)** — a minimal standalone
+  `tcp_server` protocol (echo) demonstrating the per-connection TCP server layer
+  on its own, without HTTP. See its [README](./examples/tcp_echo/README.md).
 
 ## Installation
 

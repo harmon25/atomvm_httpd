@@ -22,7 +22,7 @@
 -export([send/2]).
 
 -behavior(gen_server).
--export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 % -define(TRACE_ENABLED, true).
 -include_lib("atomvm_httpd/include/trace.hrl").
@@ -65,12 +65,7 @@ handle_web_socket_message(WebSocket, Packet) ->
     gen_server:cast(WebSocket, {message, Packet}).
 
 send(WebSocket, Packet) ->
-    case self() of
-        WebSocket ->
-            throw(badarg);
-        _ ->
-            gen_server:call(WebSocket, {send, Packet})
-    end.
+    gen_server:cast(WebSocket, {send, Packet}).
 
 
 %%
@@ -138,13 +133,17 @@ handle_cast({message, Packet}, State) ->
             ?TRACE("ParseFrameError: ~p", [ParseFrameError]),
             socket:close(Socket),
             {stop, ParseFrameError, State}
-    end.
+    end;
+%% @hidden
+handle_cast({send, Packet}, State) ->
+    ?TRACE("Sending packet ~p", [Packet]),
+    do_send(State#state.socket, Packet, text),
+    {noreply, State}.
 
 %% @hidden
-handle_call({send, Packet}, _From, State) ->
-    ?TRACE("Sending packet ~p", [Packet]),
-    Reply = do_send(State#state.socket, Packet, text),
-    {reply, Reply, State}.
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
+
 
 %% @hidden
 handle_info(_Msg, State) ->
@@ -242,26 +241,26 @@ extract_payload(Mask, PayloadLen, Data) ->
     end.
 
 %% @private
-unmask(MaskingKey, MaskedPayload) ->
-    unmask(MaskingKey, MaskedPayload, 0, []).
+unmask(<<K0:8, K1:8, K2:8, K3:8>>, Payload) ->
+    Size = byte_size(Payload),
+    FullChunks = Size bsr 2,
+    Rem = Size band 3,
+    case Rem of
+        0 ->
+            << <<(A bxor K0), (B bxor K1), (C bxor K2), (D bxor K3)>> ||
+                <<A, B, C, D>> <= Payload >>;
+        _ ->
+            ChunkSize = FullChunks bsl 2,
+            <<ChunkedPart:ChunkSize/binary, Tail/binary>> = Payload,
+            Unmasked = << <<(A bxor K0), (B bxor K1), (C bxor K2), (D bxor K3)>> ||
+                <<A, B, C, D>> <= ChunkedPart >>,
+            <<Unmasked/binary, (unmask_rem(Tail, K0, K1, K2, K3, Rem))/binary>>
+    end.
 
-unmask(_MaskingKey, <<"">>, _I, Accum) ->
-    % ?TRACE("unmasked Accum: ~p", [Accum]),
-    list_to_binary(lists:reverse(Accum));
-unmask(MaskingKey, <<H:8, T/binary>>, I, Accum) ->
-    MaskingOctet = octet(MaskingKey, I rem 4),
-    % ?TRACE("H: ~p, MaskingOctet: ~p", [H, MaskingOctet]),
-    unmask(MaskingKey, T, I + 1, [MaskingOctet bxor H | Accum]).
-
-%% @private
-octet(<<First:8, _/binary>>, 0) ->
-    First;
-octet(<<_:1/binary, Second:8, _/binary>>, 1) ->
-    Second;
-octet(<<_:2/binary, Third:8, _/binary>>, 2) ->
-    Third;
-octet(<<_:3/binary, Fourth:8, _/binary>>, 3) ->
-    Fourth.
+unmask_rem(<<>>, _, _, _, _, 0) -> <<>>;
+unmask_rem(<<B>>, K0, _, _, _, 1) -> <<(B bxor K0)>>;
+unmask_rem(<<B, C>>, K0, K1, _, _, 2) -> <<(B bxor K0), (C bxor K1)>>;
+unmask_rem(<<B, C, D>>, K0, K1, K2, _, 3) -> <<(B bxor K0), (C bxor K1), (D bxor K2)>>.
 
 %% @private
 do_send(Socket, Packet, Mode) ->
@@ -277,7 +276,7 @@ frame(Packet, Mode) when is_binary(Packet) ->
     Opcode = case Mode of text -> 16#01; binary -> 16#02; _ -> 16#01 end,
     FinOpcode = Fin bor Opcode,
     PayloadLen = erlang:byte_size(Packet),
-    case {PayloadLen =< 125, PayloadLen =< 65536} of
+    case {PayloadLen =< 125, PayloadLen < 65536} of
         {true, _} ->
             NoMask = 16#7F,
             MaskLen = NoMask band PayloadLen,

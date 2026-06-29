@@ -22,13 +22,7 @@ defmodule AtomvmHttpd.MixProject do
     ]
   end
 
-  # Run "mix help deps" to learn about dependencies.
-  defp deps do
-    [
-      # {:dep_from_hexpm, "~> 0.3.0"},
-      # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
-    ]
-  end
+  defp deps, do: []
 
   defp erlc_options(:test), do: [:debug_info, {:d, :TEST}]
   defp erlc_options(_env), do: [:debug_info]

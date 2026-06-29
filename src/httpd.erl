@@ -17,14 +17,14 @@
 
 -module(httpd).
 
--export([start/2, start/3, start/4, start_link/2, start_link/3, start_link/4, stop/1]).
--export([init/1, handle_receive/3, handle_tcp_closed/2]).
+-export([start/2, start/3, start/4, start/5, start_link/2, start_link/3, start_link/4, start_link/5, stop/1]).
+-export([init/2, handle_data/2, handle_close/2, handle_timeout/1]).
 
 -ifdef(TEST).
--export([maybe_parse_http_request/1, handle_request_state/3, get_request_state/1]).
+-export([maybe_parse_http_request/1, handle_request_state/2, get_request_state/1]).
 -endif.
 
--behaviour(gen_tcp_server).
+-behaviour(tcp_server).
 -include("httpd.hrl").
 
 % -define(TRACE_ENABLED, true).
@@ -43,7 +43,8 @@
     query_params := query_params(),
     headers := #{binary() := binary()},
     body := binary(),
-    socket := term()
+    socket := term(),
+    version := binary()
 }.
 -type handler_config() :: #{
     module := module(),
@@ -66,144 +67,185 @@
     not_found | bad_request | internal_server_error |
     term().
 
+%% Per-connection state.  Each connection runs in its own tcp_server worker
+%% process, so there is no socket-keyed bookkeeping: every field is for THIS
+%% connection only.
 -record(state, {
+    socket,
     config,
-    pending_request_map = #{},
-    ws_socket_map = #{},
-    pending_buffer_map = #{}
+    %% Partially-accumulated HttpRequest awaiting more body bytes, or undefined.
+    pending_request = undefined,
+    %% Buffered header bytes not yet forming a complete request line+headers.
+    buffer = <<>>,
+    %% WebSocket handler gen_server pid once upgraded, or undefined.
+    ws = undefined,
+    request_timeout = 30000
 }).
 
 %%
 %% API
 %%
 
+-type options() :: #{
+    request_timeout => pos_integer()
+}.
+
 -spec start(Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start(Port, Config) ->
-    start(any, Port, #{}, Config).
+    start(any, Port, #{}, #{}, Config).
 
 -spec start(Address :: address(), Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start(Address, Port, Config) ->
-    start(Address, Port, #{}, Config).
+    start(Address, Port, #{}, #{}, Config).
 
 -spec start(Address :: address(), Port :: portnum(), SocketOptions :: map(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start(Address, Port, SocketOptions, Config) ->
-    gen_tcp_server:start(#{addr => Address, port => Port}, SocketOptions, ?MODULE, Config).
+    start(Address, Port, SocketOptions, #{}, Config).
+
+-spec start(Address :: address(), Port :: portnum(), SocketOptions :: map(), Options :: options(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
+start(Address, Port, SocketOptions, Options, Config) ->
+    tcp_server:start(#{addr => Address, port => Port}, with_recv_timeout(SocketOptions, Options), ?MODULE, {Options, Config}).
 
 -spec start_link(Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Port, Config) ->
-    start_link(any, Port, #{}, Config).
+    start_link(any, Port, #{}, #{}, Config).
 
 -spec start_link(Address :: address(), Port :: portnum(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Address, Port, Config) ->
-    start_link(Address, Port, #{}, Config).
+    start_link(Address, Port, #{}, #{}, Config).
 
 -spec start_link(Address :: address(), Port :: portnum(), SocketOptions :: map(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
 start_link(Address, Port, SocketOptions, Config) ->
-    gen_tcp_server:start_link(#{addr => Address, port => Port}, SocketOptions, ?MODULE, Config).
+    start_link(Address, Port, SocketOptions, #{}, Config).
+
+-spec start_link(Address :: address(), Port :: portnum(), SocketOptions :: map(), Options :: options(), Config :: config()) -> {ok, HTTPD :: pid()} | {error, Reason :: term()}.
+start_link(Address, Port, SocketOptions, Options, Config) ->
+    tcp_server:start_link(#{addr => Address, port => Port}, with_recv_timeout(SocketOptions, Options), ?MODULE, {Options, Config}).
 
 stop(Httpd) ->
-    gen_tcp_server:stop(Httpd).
+    tcp_server:stop(Httpd).
+
+%% @private
+%% The request timeout is enforced by tcp_server's recv timeout: inject it as
+%% the `recv_timeout' socket option so a stalled (partial) request wakes the
+%% worker via handle_timeout/1.
+with_recv_timeout(SocketOptions, Options) ->
+    Timeout = maps:get(request_timeout, Options, 30000),
+    SocketOptions#{recv_timeout => Timeout}.
 
 %%
-%% gen_tcp_server implementation
+%% tcp_server implementation
 %%
 
 %% @hidden
-init(Config) ->
-    {ok, #state{config = Config}}.
+init(Socket, {Options, Config}) ->
+    Timeout = maps:get(request_timeout, Options, 30000),
+    {ok, #state{socket = Socket, config = Config, request_timeout = Timeout}};
+init(Socket, Config) ->
+    %% Backwards-compatible: called with just Config (no Options).
+    {ok, #state{socket = Socket, config = Config}}.
 
 %% @hidden
-handle_receive(Socket, Packet, State) ->
+handle_data(Packet, #state{ws = undefined} = State) ->
     try
-        case maps:get(Socket, State#state.ws_socket_map, undefined) of
-            undefined ->
-                handle_http_request(Socket, Packet, State);
-            WebSocket ->
-                case httpd_ws_handler:handle_web_socket_message(WebSocket, Packet) of
-                    ok ->
-                        {noreply, State};
-                    Error ->
-                        {close, create_error(?INTERNAL_SERVER_ERROR, Error)}
-                end
-        end
+        handle_http_request(Packet, State)
     catch
         A:E:S ->
             io:format("Caught error: ~p:~p:~p~n", [A, E, S]),
-            {close, create_error(?BAD_REQUEST, E)}
+            {send_close, create_error(?BAD_REQUEST, E)}
+    end;
+handle_data(Packet, #state{ws = WebSocket} = State) ->
+    case httpd_ws_handler:handle_web_socket_message(WebSocket, Packet) of
+        ok ->
+            {continue, State};
+        Error ->
+            {send_close, create_error(?INTERNAL_SERVER_ERROR, Error)}
     end.
 
 %% @private
-handle_http_request(Socket, Packet, State) ->
-    PendingRequestMap = State#state.pending_request_map,
-    BufferMap = State#state.pending_buffer_map,
-    PendingBuffer = maps:get(Socket, BufferMap, <<>>),
+handle_http_request(Packet, State) ->
+    PendingBuffer = State#state.buffer,
     AccumulatedPacket = <<PendingBuffer/binary, Packet/binary>>,
-    case maps:get(Socket, PendingRequestMap, undefined) of
+    case State#state.pending_request of
         undefined ->
             case maybe_parse_http_request(AccumulatedPacket) of
                 {more, IncompletePacket} ->
-                    NewBufferMap = BufferMap#{Socket => IncompletePacket},
-                    {noreply, State#state{pending_buffer_map = NewBufferMap}};
+                    {continue, State#state{buffer = IncompletePacket}};
                 {ok, HttpRequest} ->
-                    CleanBufferMap = maps:remove(Socket, BufferMap),
-                    CleanState = State#state{pending_buffer_map = CleanBufferMap},
-                    % ?TRACE("HttpRequest: ~p~n", [HttpRequest]),
+                    CleanState = State#state{buffer = <<>>},
                     #{
                         method := Method,
                         headers := Headers
                     } = HttpRequest,
-                    case get_protocol(Method, Headers) of
-                        http ->
-                            case init_handler(HttpRequest, CleanState) of
-                                {ok, {Handler, HandlerState, PathSuffix, HandlerConfig}} ->
-                                    NewHttpRequest = HttpRequest#{
-                                        handler => Handler,
-                                        handler_state => HandlerState,
-                                        path_suffix => PathSuffix,
-                                        handler_config => HandlerConfig,
-                                        socket => Socket
-                                    },
-                                    handle_request_state(Socket, NewHttpRequest, CleanState);
-                                Error ->
-                                    {close, create_error(?INTERNAL_SERVER_ERROR, Error)}
-                            end;
-                        ws ->
-                            ?TRACE("Protocol is ws", []),
-                            Config = CleanState#state.config,
-                            Path = maps:get(path, HttpRequest),
-                            case get_handler(Path, Config) of
-                                {ok, PathSuffix, EntryConfig} ->
-                                    WsHandler = maps:get(handler, EntryConfig),
-                                    ?TRACE("Got handler ~p", [WsHandler]),
-                                    HandlerConfig = maps:get(handler_config, EntryConfig, #{}),
-                                    case WsHandler:start(Socket, PathSuffix, HandlerConfig) of
-                                        {ok, WebSocket} ->
-                                            ?TRACE("Started web socket handler: ~p", [WebSocket]),
-                                            NewWebSocketMap = maps:put(Socket, WebSocket, CleanState#state.ws_socket_map),
-                                            NewState = CleanState#state{ws_socket_map = NewWebSocketMap},
-                                            ReplyToken = get_reply_token(maps:get(headers, HttpRequest)),
-                                            ReplyHeaders = #{"Upgrade" => "websocket", "Connection" => "Upgrade", "Sec-WebSocket-Accept" => ReplyToken},
-                                            Reply = create_reply(?SWITCHING_PROTOCOLS, ReplyHeaders, <<"">>),
-                                            ?TRACE("Sending web socket upgrade reply: ~p", [Reply]),
-                                            {reply, Reply, NewState};
-                                        Error ->
-                                            ?TRACE("Web socket error: ~p", [Error]),
-                                            {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
-                                    end;
-                                Error ->
-                                    {close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                    case Method of
+                        undefined ->
+                            {send_close, create_error(?NOT_ALLOWED, method_not_allowed)};
+                        _ ->
+                            case get_protocol(Method, Headers) of
+                                http ->
+                                    handle_http_protocol(HttpRequest, CleanState);
+                                ws ->
+                                    handle_ws_upgrade(HttpRequest, CleanState)
                             end
                     end;
                 {error, Reason} ->
-                    {close, create_error(?BAD_REQUEST, Reason)}
+                    {send_close, create_error(?BAD_REQUEST, Reason)}
             end;
         PendingHttpRequest ->
             ?TRACE("Packetlen: ~p", [erlang:byte_size(Packet)]),
             ExistingBody = maps:get(body, PendingHttpRequest, <<>>),
             NewBody = <<ExistingBody/binary, Packet/binary>>,
-            CleanBufferMap = maps:remove(Socket, BufferMap),
-            CleanState = State#state{pending_buffer_map = CleanBufferMap},
-            handle_request_state(Socket, PendingHttpRequest#{body := NewBody}, CleanState)
+            CleanState = State#state{buffer = <<>>},
+            handle_request_state(PendingHttpRequest#{body := NewBody}, CleanState)
+    end.
+
+%% @private
+handle_http_protocol(HttpRequest, State) ->
+    case init_handler(HttpRequest, State) of
+        {ok, {Handler, HandlerState, PathSuffix, HandlerConfig}} ->
+            NewHttpRequest = HttpRequest#{
+                handler => Handler,
+                handler_state => HandlerState,
+                path_suffix => PathSuffix,
+                handler_config => HandlerConfig,
+                socket => State#state.socket
+            },
+            handle_request_state(NewHttpRequest, State);
+        Error ->
+            {send_close, create_error(?INTERNAL_SERVER_ERROR, Error)}
+    end.
+
+%% @private
+handle_ws_upgrade(HttpRequest, State) ->
+    ?TRACE("Protocol is ws", []),
+    Headers = maps:get(headers, HttpRequest, #{}),
+    case get_ws_key(Headers) of
+        {ok, WebSocketKey} ->
+            ReplyToken = get_reply_token(WebSocketKey),
+            Config = State#state.config,
+            Path = maps:get(path, HttpRequest),
+            case get_handler(Path, Config) of
+                {ok, PathSuffix, EntryConfig} ->
+                    WsHandler = maps:get(handler, EntryConfig),
+                    ?TRACE("Got handler ~p", [WsHandler]),
+                    HandlerConfig = maps:get(handler_config, EntryConfig, #{}),
+                    case WsHandler:start(State#state.socket, PathSuffix, HandlerConfig) of
+                        {ok, WebSocket} ->
+                            ?TRACE("Started web socket handler: ~p", [WebSocket]),
+                            NewState = State#state{ws = WebSocket},
+                            ReplyHeaders = #{"Upgrade" => "websocket", "Connection" => "Upgrade", "Sec-WebSocket-Accept" => ReplyToken},
+                            Reply = create_reply(?SWITCHING_PROTOCOLS, ReplyHeaders, <<"">>),
+                            ?TRACE("Sending web socket upgrade reply: ~p", [Reply]),
+                            {send, Reply, NewState};
+                        Error ->
+                            ?TRACE("Web socket error: ~p", [Error]),
+                            {send_close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+                    end;
+                Error ->
+                    {send_close, create_error(?INTERNAL_SERVER_ERROR, {web_socket_error, Error})}
+            end;
+        error ->
+            {send_close, create_error(?BAD_REQUEST, missing_websocket_key)}
     end.
 
 %% @private
@@ -226,34 +268,30 @@ init_handler(HttpRequest, State) ->
     end.
 
 %% @private
-handle_request_state(Socket, HttpRequest, State) ->
-    PendingRequestMap = State#state.pending_request_map,
+handle_request_state(HttpRequest, State) ->
     case get_request_state(HttpRequest) of
         complete ->
             ?TRACE("Request complete.  Handling...", []),
-            NewPendingRequestMap = maps:remove(Socket, PendingRequestMap),
-            call_http_req_handler(Socket, HttpRequest, State#state{pending_request_map = NewPendingRequestMap});
+            call_http_req_handler(HttpRequest, State#state{pending_request = undefined});
         expect_continue ->
             Headers = maps:get(headers, HttpRequest),
-            NewHeaders = maps:remove(<<"Expect">>, Headers),
+            NewHeaders = maps:remove(<<"expect">>, Headers),
             NewHttpRequest = HttpRequest#{headers := NewHeaders},
             Reply = create_reply(?CONTINUE, #{}, <<"">>),
-            NewPendingRequestMap = PendingRequestMap#{Socket => NewHttpRequest},
-            {reply, Reply, State#state{pending_request_map = NewPendingRequestMap}};
+            {send, Reply, State#state{pending_request = NewHttpRequest}};
         wait_for_body ->
-            NewPendingRequestMap = PendingRequestMap#{Socket => HttpRequest},
-            {noreply, State#state{pending_request_map = NewPendingRequestMap}}
+            {continue, State#state{pending_request = HttpRequest}}
     end.
 
 %% @private
 get_request_state(HttpRequest) ->
     Headers = maps:get(headers, HttpRequest),
-    case maps:get(<<"Expect">>, Headers, undefined) of
+    case maps:get(<<"expect">>, Headers, undefined) of
         <<"100-continue">> ->
             ?TRACE("Expect: 100-continue", []),
             expect_continue;
         undefined ->
-            case maps:get(<<"Content-Length">>, Headers, undefined) of
+            case maps:get(<<"content-length">>, Headers, undefined) of
                 undefined ->
                     ?TRACE("No content length; request complete", []),
                     complete;
@@ -274,73 +312,81 @@ get_request_state(HttpRequest) ->
     end.
 
 %% @private
-call_http_req_handler(Socket, HttpRequest, State) ->
+call_http_req_handler(HttpRequest, State) ->
     #{
         handler := Handler,
         handler_state := HandlerState
     } = HttpRequest,
     case Handler:handle_http_req(HttpRequest, HandlerState) of
-        %% noreply
+        %% noreply — handler wants more body data for THIS request; keep it
+        %% pending (with the updated handler_state) so the next packet is
+        %% appended to its body rather than parsed as a fresh request.
         {noreply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {noreply, NewState};
-        %% reply
-        {reply, Reply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {reply, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply), NewState};
-        {reply, ReplyHeaders, Reply, NewHandlerState} ->
-            NewState = update_state(Socket, HttpRequest, NewHandlerState, State),
-            {reply, create_reply(?OK, ReplyHeaders, Reply), NewState};
-        %% close
+            {continue, State#state{pending_request = HttpRequest#{handler_state := NewHandlerState}}};
+        %% reply — send the response and keep the connection open for the next
+        %% request (keep-alive).  pending_request is cleared so the next packet
+        %% is parsed fresh.
+        %% NOTE: HTTP/1.0 default-close and Connection: close semantics are not yet
+        %% implemented; that negotiation is deferred to a follow-up.  Handlers that
+        %% need to force a close should return {close, ...} instead.
+        {reply, Reply, _NewHandlerState} ->
+            {send, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply),
+                State#state{pending_request = undefined}};
+        {reply, ReplyHeaders, Reply, _NewHandlerState} ->
+            {send, create_reply(?OK, ReplyHeaders, Reply), State#state{pending_request = undefined}};
+        %% close — handler explicitly requests connection close; always honour it
+        %% regardless of the client's keep-alive preference, preserving the documented
+        %% httpd_handler contract that {close, ...} means "send response, close connection".
         close ->
             {close, State};
         {close, Reply} ->
-            {close, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply)};
+            {send_close, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply)};
         {close, ReplyHeaders, Reply} ->
-            {close, create_reply(?OK, ReplyHeaders, Reply)};
+            {send_close, create_reply(?OK, ReplyHeaders, Reply)};
         %% errors
         {error, not_found} ->
-            {close, create_error(?NOT_FOUND, not_found)};
+            {send_close, create_error(?NOT_FOUND, not_found)};
         {error, bad_request} ->
-            {close, create_error(?BAD_REQUEST, bad_request)};
+            {send_close, create_error(?BAD_REQUEST, bad_request)};
         {error, internal_server_error} ->
-            {close, create_error(?INTERNAL_SERVER_ERROR, internal_server_error)};
+            {send_close, create_error(?INTERNAL_SERVER_ERROR, internal_server_error)};
         HandlerError ->
-            {close, create_error(?INTERNAL_SERVER_ERROR, HandlerError)}
+            {send_close, create_error(?INTERNAL_SERVER_ERROR, HandlerError)}
     end.
-
-%% @private
-update_state(Socket, HttpRequest, HandlerState, State) ->
-    NewHttpRequest = HttpRequest#{handler_state := HandlerState},
-    PendingRequestMap = State#state.pending_request_map,
-    NewPendingRequestMap = PendingRequestMap#{Socket => NewHttpRequest},
-    State#state{pending_request_map = NewPendingRequestMap}.
-
 
 %% @hidden
-handle_tcp_closed(Socket, State) ->
-    NewPendingRequestMap = maps:remove(Socket, State#state.pending_request_map),
-    NewPendingBufferMap = maps:remove(Socket, State#state.pending_buffer_map),
-    CleanState = State#state{
-        pending_request_map = NewPendingRequestMap,
-        pending_buffer_map = NewPendingBufferMap
-    },
-    case maps:get(Socket, CleanState#state.ws_socket_map, undefined) of
-        undefined ->
-            CleanState;
-        WebSocket ->
-            ok = httpd_ws_handler:stop(WebSocket),
-            NewWebSocketMap = maps:remove(Socket, CleanState#state.ws_socket_map),
-            CleanState#state{ws_socket_map = NewWebSocketMap}
-    end.
+handle_close(_Reason, #state{ws = undefined}) ->
+    ok;
+handle_close(_Reason, #state{ws = WebSocket}) ->
+    %% Stop the WebSocket handler gen_server; it may already be gone if it
+    %% closed the socket itself, so guard against a noproc exit.
+    catch httpd_ws_handler:stop(WebSocket),
+    ok.
+
+%% @hidden
+%% Invoked by tcp_server when a blocking recv hits the request_timeout with no
+%% data.  If a request is in flight (partial headers buffered, or a body still
+%% being received) the client has stalled — close.  Otherwise the connection is
+%% simply idle (e.g. keep-alive between requests, or an established WebSocket) —
+%% keep waiting.
+handle_timeout(#state{pending_request = undefined, buffer = <<>>} = State) ->
+    {continue, State};
+handle_timeout(State) ->
+    ?TRACE("Request timeout — closing stalled connection", []),
+    {close, State}.
 
 %%
 %% Internal functions
 %%
 
 %% @private
-get_reply_token(Headers) ->
-    #{<<"Sec-WebSocket-Key">> := WebSocketKey} = Headers,
+get_ws_key(#{<<"sec-websocket-key">> := Key}) ->
+    {ok, Key};
+get_ws_key(_) ->
+    error.
+
+%% @private
+get_reply_token(WebSocketKey) ->
     MagicKey = <<"258EAFA5-E914-47DA-95CA-C5AB0DC85B11">>,
     PreImage = <<WebSocketKey/binary, MagicKey/binary>>,
     ReplyToken = base64:encode(crypto:hash(sha, PreImage)),
@@ -348,14 +394,14 @@ get_reply_token(Headers) ->
     ReplyToken.
 
 %% @private
-parse_http_request(Packet) ->
-    {Heading, HeadingRest} = parse_heading(Packet, start, [], #{}),
-    {Headers, Body} = parse_header(HeadingRest, #{}),
+parse_http_request(HeadingList, Body) ->
+    {Heading, _HeadingRest} = parse_heading(HeadingList, start, [], #{}),
+    {Headers, _} = parse_header(_HeadingRest, #{}),
     maps:merge(
         Heading,
         #{
             headers => Headers,
-            body => erlang:list_to_binary(Body)
+            body => Body
         }
     ).
 
@@ -363,9 +409,11 @@ maybe_parse_http_request(Packet) when is_binary(Packet) ->
     case find_header_delimiter(Packet) of
         nomatch ->
             {more, Packet};
-        {_Pos, _Len} ->
+        {Pos, Len} ->
             try
-                {ok, parse_http_request(binary_to_list(Packet))}
+                HeaderEnd = Pos + Len,
+                <<HeadingPart:HeaderEnd/binary, Body/binary>> = Packet,
+                {ok, parse_http_request(binary_to_list(HeadingPart), Body)}
             catch
                 throw:Reason ->
                     {error, Reason};
@@ -410,8 +458,13 @@ parse_heading([$\s|Rest], wait_version, Tmp, Accum) ->
 parse_heading(Packet, wait_version, Tmp, Accum) ->
     parse_heading(Packet, in_version, Tmp, Accum);
 %% in_version state
-parse_heading([$\n|Rest], in_version, _Tmp, Accum) ->
-    {Accum, Rest};
+parse_heading([$\n|Rest], in_version, Tmp, Accum) ->
+    RawVersion = lists:reverse(Tmp),
+    Version = case RawVersion of
+        [$\r | Clean] -> list_to_binary(Clean);
+        _ -> list_to_binary(RawVersion)
+    end,
+    {Accum#{version => Version}, Rest};
 parse_heading([C|Rest], in_version, Tmp, Accum) ->
     parse_heading(Rest, in_version, [C|Tmp], Accum);
 %% error state
@@ -439,9 +492,12 @@ parse_line(_Packet, _Accum) ->
 
 %% @private
 split_header(Header) ->
-    [Key, Value] = string:split(Header, ":"),
-    %% TODO to_lower the key
-    {list_to_binary(string:trim(Key)), list_to_binary(string:trim(Value))}.
+    case string:split(Header, ":") of
+        [Key, Value] ->
+            {list_to_binary(string:to_lower(string:trim(Key))), list_to_binary(string:trim(Value))};
+        _ ->
+            throw(bad_header)
+    end.
 
 normalize_uri(Uri) ->
     case string:split(Uri, "?", leading) of
@@ -458,8 +514,17 @@ tokenize_path(Path) ->
 %% @private
 parse_query_params(QueryParamString) ->
     NVPairsStrings = string:split(QueryParamString, "&", all),
-    NVPairLists = [string:split(NVPairString, "=") || NVPairString <- NVPairsStrings],
-    maps:from_list([{list_to_atom(Key), url_decode(Value, [])} || [Key, Value] <- NVPairLists]).
+    maps:from_list([parse_query_param(NVPairString) || NVPairString <- NVPairsStrings]).
+
+parse_query_param(NVPairString) ->
+    case string:split(NVPairString, "=") of
+        [Key] ->
+            {list_to_binary(Key), <<"">>};
+        [Key, Value] ->
+            %% url_decode/2 returns a charlist; convert to binary so all
+            %% query param values are binaries as declared in query_params().
+            {list_to_binary(Key), list_to_binary(url_decode(Value, []))}
+    end.
 
 % from https://docs.microfocus.com/OMi/10.62/Content/OMi/ExtGuide/ExtApps/URL_encoding.htm
 url_decode([], Accum) ->
@@ -558,7 +623,7 @@ starts_with([_H1|_], [_H2|_]) ->
 
 
 %% @private
-get_protocol(get, #{<<"Upgrade">> := <<"websocket">>, <<"Connection">> := Upgrade, <<"Sec-WebSocket-Key">> := _, <<"Sec-WebSocket-Version">> := <<"13">>} = _Headers) ->
+get_protocol(get, #{<<"upgrade">> := <<"websocket">>, <<"connection">> := Upgrade, <<"sec-websocket-key">> := _, <<"sec-websocket-version">> := <<"13">>} = _Headers) ->
     case str(string:to_upper(binary_to_list(Upgrade)), "UPGRADE") of
         0 ->
             http;
@@ -580,7 +645,12 @@ create_reply(StatusCode, ContentType, Reply) when is_list(ContentType) orelse is
     create_reply(StatusCode, #{"Content-Type" => ContentType}, Reply);
 create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
     ReplyLen = erlang:iolist_size(Reply),
-    HeadersWithLen = ensure_content_length(Headers, ReplyLen),
+    %% Normalize all header keys to lowercase binary before computing
+    %% Content-Length so that ensure_content_length/2 can reliably strip any
+    %% pre-existing content-length variant (e.g. "Content-Length", <<"Content-Length">>)
+    %% and avoid emitting duplicate headers.
+    NormalizedHeaders = normalize_headers(Headers),
+    HeadersWithLen = ensure_content_length(NormalizedHeaders, ReplyLen),
     [
         <<"HTTP/1.1 ">>, erlang:integer_to_binary(StatusCode), <<" ">>, moniker(StatusCode),
         <<"\r\n">>,
@@ -591,20 +661,33 @@ create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
     ].
 
 %% @private
-ensure_content_length(Headers, ReplyLen) ->
-    LenBin = erlang:integer_to_binary(ReplyLen),
-    CleanHeaders = remove_content_length_header(Headers),
-    CleanHeaders#{<<"Content-Length">> => LenBin}.
+%% Rewrite every key in a response-header map to a lowercase binary so that
+%% ensure_content_length/2 and to_headers_list/1 always operate on a uniform
+%% representation regardless of whether the caller used strings, binaries, or
+%% mixed-case atoms.
+normalize_headers(Headers) ->
+    maps:fold(
+        fun(Key, Value, Acc) ->
+            NormKey = normalize_header_key(Key),
+            Acc#{NormKey => Value}
+        end,
+        #{},
+        Headers
+    ).
+
+normalize_header_key(Key) when is_binary(Key) ->
+    list_to_binary(string:to_lower(binary_to_list(Key)));
+normalize_header_key(Key) when is_list(Key) ->
+    list_to_binary(string:to_lower(Key));
+normalize_header_key(Key) when is_atom(Key) ->
+    list_to_binary(string:to_lower(atom_to_list(Key))).
 
 %% @private
-remove_content_length_header(Headers) ->
-    KeysToRemove = [
-        "Content-Length",
-        <<"Content-Length">>,
-        "content-length",
-        <<"content-length">>
-    ],
-    lists:foldl(fun(Key, Acc) -> maps:remove(Key, Acc) end, Headers, KeysToRemove).
+ensure_content_length(Headers, ReplyLen) ->
+    LenBin = erlang:integer_to_binary(ReplyLen),
+    %% After normalize_headers/1 the key is always <<"content-length">>.
+    CleanHeaders = maps:remove(<<"content-length">>, Headers),
+    CleanHeaders#{<<"content-length">> => LenBin}.
 
 %% @private
 maybe_binary_to_string(Bin) when is_binary(Bin) ->
@@ -640,6 +723,8 @@ moniker(?BAD_REQUEST) ->
     <<"BAD_REQUEST">>;
 moniker(?NOT_FOUND) ->
     <<"NOT_FOUND">>;
+moniker(?NOT_ALLOWED) ->
+    <<"METHOD_NOT_ALLOWED">>;
 moniker(?CONTINUE) ->
     <<"Continue">>;
 moniker(?SWITCHING_PROTOCOLS) ->
@@ -658,3 +743,5 @@ method_to_atom("DELETE") ->
     delete;
 method_to_atom(_) ->
     undefined.
+
+

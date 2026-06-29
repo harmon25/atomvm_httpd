@@ -25,3 +25,5 @@ atomvm_httpd-*.tar
 .elixir_ls/
 
 mise.local.toml
+
+/*.avm

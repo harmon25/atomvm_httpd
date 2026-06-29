@@ -24,13 +24,22 @@ defmodule HttpdIntegrationTest do
     {:ok, server} = :httpd.start_link(port, config)
     Process.sleep(20)
 
-    on_exit(fn ->
-      if Process.alive?(server) do
-        :httpd.stop(server)
-      end
-    end)
+    on_exit(fn -> safe_stop(server) end)
 
     {:ok, port: port}
+  end
+
+  # The server is linked to the test process (start_link) and traps exits, so it
+  # shuts down as the test process exits — racing on_exit's stop. Tolerate a
+  # server that is already gone.
+  defp safe_stop(server) do
+    if Process.alive?(server) do
+      try do
+        :httpd.stop(server)
+      catch
+        :exit, _ -> :ok
+      end
+    end
   end
 
   test "reassembles POST bodies across tcp frames", %{port: port} do
@@ -38,7 +47,7 @@ defmodule HttpdIntegrationTest do
 
     try do
       request_chunks = [
-        "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\n\r\nhe",
+        "POST / HTTP/1.1\r\nHost: example.com\r\ncontent-length: 11\r\n\r\nhe",
         "llo=",
         "world"
       ]
@@ -69,7 +78,7 @@ defmodule HttpdIntegrationTest do
 
       assert_receive {:http_request, request}, @receive_timeout
       headers = Map.fetch!(request, :headers)
-      assert <<"value123">> = Map.fetch!(headers, <<"X-Custom-Header">>)
+      assert <<"value123">> = Map.fetch!(headers, <<"x-custom-header">>)
 
       assert {:ok, response} = :gen_tcp.recv(socket, 0, @receive_timeout)
       assert response =~ "HTTP/1.1 200 OK"
@@ -114,7 +123,7 @@ defmodule HttpdIntegrationTest do
       [headers, body] = :binary.split(response, <<"\r\n\r\n">>)
 
       assert String.contains?(headers, "HTTP/1.1 200 OK")
-      assert String.contains?(headers, "Content-Length: " <> @large_iolist_len)
+      assert String.contains?(headers, "content-length: " <> @large_iolist_len)
       assert byte_size(body) == :erlang.iolist_size(@large_iolist)
     after
       :gen_tcp.close(socket)
@@ -140,8 +149,9 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -169,8 +179,9 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -198,8 +209,9 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -227,8 +239,9 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -256,8 +269,9 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
@@ -285,13 +299,232 @@ defmodule HttpdIntegrationTest do
       assert String.contains?(headers, "HTTP/1.1 200 OK")
 
       expected_length = :erlang.iolist_size(iolist)
-      assert String.contains?(headers, "Content-Length: #{expected_length}"),
-             "Expected Content-Length: #{expected_length}"
+
+      assert String.contains?(headers, "content-length: #{expected_length}"),
+             "Expected content-length: #{expected_length}"
 
       assert body == expected_body
       assert byte_size(body) == expected_length
     after
       :gen_tcp.close(socket)
+    end
+  end
+
+  describe "chunk_size socket option" do
+    # Deliberately small chunk size to exercise multi-chunk send path on a
+    # small test body, and verify the key is stripped so socket:setopt is
+    # never called with it (which would crash with a badmatch).
+    @small_chunk 512
+    @large_response_body :binary.copy("x", 16_384)
+
+    setup do
+      port = find_free_tcp_port()
+
+      config = [
+        {[], %{handler: TestEchoHandler, handler_config: %{test_pid: self()}}}
+      ]
+
+      {:ok, server} =
+        :httpd.start_link(:any, port, %{chunk_size: @small_chunk}, config)
+
+      Process.sleep(20)
+
+      on_exit(fn ->
+        safe_stop(server)
+      end)
+
+      {:ok, port: port}
+    end
+
+    test "server starts successfully with chunk_size option (option is not passed to socket:setopt)",
+         %{port: port} do
+      # If chunk_size leaked into set_socket_options/2 the server would have
+      # crashed at startup — this assertion also validates that.
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok =
+          :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+        assert {:ok, response} = recv_all(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "large response body is delivered intact across many small chunks" do
+      # Start a fresh server whose handler is configured to reply with the large
+      # body — this exercises the multi-chunk send path without coupling to the
+      # echo handler's default behaviour.
+      port = find_free_tcp_port()
+      body_size = byte_size(@large_response_body)
+
+      config = [
+        {[],
+         %{
+           handler: TestEchoHandler,
+           handler_config: %{
+             test_pid: self(),
+             reply_body: @large_response_body,
+             reply_headers: %{"Content-Type" => "application/octet-stream"}
+           }
+         }}
+      ]
+
+      {:ok, server} =
+        :httpd.start_link(:any, port, %{chunk_size: @small_chunk}, config)
+
+      Process.sleep(20)
+
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+        assert_receive {:http_request, _}, @receive_timeout
+
+        assert {:ok, response} = recv_all(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+
+        [_headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+
+        assert byte_size(body) == body_size,
+               "Expected #{body_size} bytes; got #{byte_size(body)}"
+      after
+        :gen_tcp.close(socket)
+        :httpd.stop(server)
+      end
+    end
+  end
+
+  describe "request timeout" do
+    # A deliberately short timeout so tests finish quickly.
+    @timeout_ms 300
+
+    # Start a second httpd with the short timeout; override :port in context.
+    setup do
+      port = find_free_tcp_port()
+      config = [{[], %{handler: TestEchoHandler, handler_config: %{test_pid: self()}}}]
+
+      {:ok, server} =
+        :httpd.start_link(:any, port, %{}, %{request_timeout: @timeout_ms}, config)
+
+      Process.sleep(20)
+
+      on_exit(fn ->
+        safe_stop(server)
+      end)
+
+      {:ok, port: port}
+    end
+
+    test "closes socket when request headers are never completed", %{port: port} do
+      {:ok, socket} = connect(port)
+      # Send an incomplete request — no \r\n\r\n header terminator, so the
+      # server buffers and starts the request timer.
+      :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: example.com\r\n")
+
+      # Wait well past the configured timeout and expect the server to close.
+      Process.sleep(@timeout_ms + 200)
+      assert {:error, :closed} = :gen_tcp.recv(socket, 0, 500)
+      :gen_tcp.close(socket)
+    end
+
+    test "closes socket when declared body is never fully delivered", %{port: port} do
+      {:ok, socket} = connect(port)
+      # Headers are complete, but Content-Length claims 100 bytes and we only
+      # send 5.  The server should start waiting for the rest and time out.
+      :ok =
+        :gen_tcp.send(
+          socket,
+          "POST / HTTP/1.1\r\nHost: example.com\r\ncontent-length: 100\r\n\r\nhello"
+        )
+
+      Process.sleep(@timeout_ms + 200)
+      assert {:error, :closed} = :gen_tcp.recv(socket, 0, 500)
+      :gen_tcp.close(socket)
+    end
+  end
+
+  describe "concurrent connections" do
+    # A large response so that, under the old single-gen_server design, serving
+    # it would block other connections. With per-connection worker processes,
+    # small requests on other connections must stay responsive.
+    @big_body :binary.copy("y", 262_144)
+
+    setup do
+      port = find_free_tcp_port()
+
+      config = [
+        {[<<"big">>],
+         %{
+           handler: TestEchoHandler,
+           handler_config: %{
+             reply_body: @big_body,
+             reply_headers: %{"Content-Type" => "text/plain"}
+           }
+         }},
+        {[], %{handler: TestEchoHandler, handler_config: %{reply_body: "small"}}}
+      ]
+
+      # Tiny chunk_size so the big response takes many send iterations.
+      {:ok, server} = :httpd.start_link(:any, port, %{chunk_size: 256}, config)
+      Process.sleep(20)
+      on_exit(fn -> safe_stop(server) end)
+      {:ok, port: port}
+    end
+
+    test "multiple connections are served independently", %{port: port} do
+      tasks =
+        for _ <- 1..5 do
+          Task.async(fn ->
+            {:ok, socket} = connect(port)
+            :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            result = recv_all(socket)
+            :gen_tcp.close(socket)
+            result
+          end)
+        end
+
+      for result <- Task.await_many(tasks, 5_000) do
+        assert {:ok, response} = result
+        assert response =~ "HTTP/1.1 200 OK"
+        [_headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+        assert body == "small"
+      end
+    end
+
+    test "a large response does not block small ones", %{port: port} do
+      # Kick off a 256KB download on one connection.
+      big_task =
+        Task.async(fn ->
+          {:ok, socket} = connect(port)
+          :ok = :gen_tcp.send(socket, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+          result = recv_all(socket)
+          :gen_tcp.close(socket)
+          result
+        end)
+
+      # While it's streaming, small requests on independent connections must
+      # complete quickly.
+      for _ <- 1..5 do
+        {elapsed_us, _} =
+          :timer.tc(fn ->
+            {:ok, socket} = connect(port)
+            :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            assert {:ok, response} = recv_all(socket)
+            assert response =~ "HTTP/1.1 200 OK"
+            :gen_tcp.close(socket)
+          end)
+
+        assert elapsed_us < 1_000_000,
+               "small request took #{elapsed_us}us while large response was streaming"
+      end
+
+      assert {:ok, big_response} = Task.await(big_task, 10_000)
+      [_headers, big_body] = :binary.split(big_response, <<"\r\n\r\n">>)
+      assert byte_size(big_body) == byte_size(@big_body)
     end
   end
 

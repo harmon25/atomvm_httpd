@@ -31,7 +31,8 @@
     method => http_method(),
     path => http_path(),
     headers => http_headers(),
-    body => binary()
+    body => binary(),
+    version => binary()
 }.
 
 %%

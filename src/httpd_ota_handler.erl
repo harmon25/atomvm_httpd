@@ -76,4 +76,4 @@ handle_http_req(_HttpRequest, _State) ->
 
 get_content_length(Headers) ->
     %% TODO handle case
-    erlang:binary_to_integer(maps:get(<<"Content-Length">>, Headers, <<"0">>)).
+    erlang:binary_to_integer(maps:get(<<"content-length">>, Headers, <<"0">>)).

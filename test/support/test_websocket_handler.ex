@@ -28,6 +28,7 @@ defmodule TestWebSocketHandler do
           Process.sleep(10)
           :httpd_ws_handler.send(websocket, "pushed message")
         end)
+
         {:reply, "echo: #{payload}", state}
 
       _ ->

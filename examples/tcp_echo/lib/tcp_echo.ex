@@ -42,7 +42,10 @@ defmodule TcpEcho do
         {:ok, ip_info}
 
       {:error, reason} ->
-        IO.puts("WiFi: attempt failed (#{inspect(reason)}); retrying (#{attempts_left - 1} left)...")
+        IO.puts(
+          "WiFi: attempt failed (#{inspect(reason)}); retrying (#{attempts_left - 1} left)..."
+        )
+
         Process.sleep(2_000)
         connect_wifi(attempts_left - 1)
     end

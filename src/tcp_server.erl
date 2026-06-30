@@ -37,7 +37,7 @@
 %% the accept loop.
 -module(tcp_server).
 
--export([start/3, start/4, start_link/3, start_link/4, stop/1, send/3]).
+-export([start/3, start/4, start_link/3, start_link/4, stop/1, send/2, send/3]).
 
 -behaviour(gen_server).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -132,6 +132,12 @@ start_link(BindOptions, SocketOptions, Protocol, Args) ->
 
 stop(Server) ->
     gen_server:stop(Server).
+
+%% @doc Chunked send helper using the default chunk size.  Convenient for
+%% out-of-band senders (e.g. the WebSocket handler) that do not track the
+%% server's configured chunk size.  Returns ok | {error, Reason}.
+send(Socket, Data) ->
+    do_send(Socket, Data, ?DEFAULT_SEND_CHUNK).
 
 %% @doc Chunked send helper for protocol modules.  Runs in the calling (worker)
 %% process, so blocking is fine.  Returns ok | {error, Reason}.
@@ -385,11 +391,20 @@ call_handle_info(Protocol, Msg, State) ->
 %% @private
 %% Max retries for a chunk that fails with a (transient) send error before
 %% giving up.  On ESP32/lwIP a socket:send that overruns the small TCP send
-%% buffer (default ~8KB) surfaces as a transient error rather than {ok, Unsent}
-%% — empirically a single 64KB response truncated ~65% of the time without
-%% retry, and 0% with it.  Each retry backs off ~10ms, so a genuinely-dead
-%% connection stalls at most ~MAX_SEND_RETRIES * 10ms before we abandon it.
+%% buffer (a few KB, ~4 × TCP_MSS) surfaces as transient backpressure:
+%% `tcp_write' returns `ERR_MEM', which AtomVM maps to `{error, eagain}'.
+%% (Older AtomVM builds without that mapping reported the same condition as
+%% `{error, closed}', so both reasons are retried for version compatibility.)
+%% Empirically a single 64KB response truncated ~65% of the time without retry,
+%% and 0% with it.  Each retry backs off ~10ms, so a genuinely-dead connection
+%% stalls at most ~MAX_SEND_RETRIES * 10ms before we abandon it.
 -define(MAX_SEND_RETRIES, 50).
+
+%% Send error reasons treated as transient backpressure (retry with backoff)
+%% rather than fatal.  `eagain' is the AtomVM lwIP/BSD backpressure signal;
+%% `closed' is retained for older AtomVM builds that reported backpressure as a
+%% (spurious) close.
+-define(IS_TRANSIENT_SEND_ERROR(Reason), (Reason =:= eagain orelse Reason =:= closed)).
 
 do_send(Socket, Packet, ChunkSize) ->
     do_send(Socket, Packet, ChunkSize, 0).
@@ -404,24 +419,40 @@ do_send(Socket, Packet, ChunkSize, Retries) when is_binary(Packet) ->
     <<ToSend:Chunk/binary, Rest/binary>> = Packet,
     case socket:send(Socket, ToSend) of
         ok ->
+            %% Whole chunk accepted.  Yield before the next chunk so we don't
+            %% monopolise the scheduler on large responses.
             case byte_size(Rest) > 0 of
                 true -> receive after 0 -> ok end;
                 false -> ok
             end,
             do_send(Socket, Rest, ChunkSize, 0);
         {ok, Unsent} ->
-            %% Partial send: lwIP send buffer full / TCP_MSS cap.  Yield to let
-            %% the stack drain, then retry the remainder.
-            ?TRACE("Partial send: unsent=~p remaining=~p", [byte_size(Unsent), TotalSize]),
-            receive after 10 -> ok end,
-            do_send(Socket, <<Unsent/binary, Rest/binary>>, ChunkSize, 0);
+            %% Partial send (BSD-style): only some of ToSend went out.  Forward
+            %% progress is made when fewer bytes are unsent than we attempted;
+            %% reset the retry budget in that case.  If *no* bytes went out
+            %% (Unsent == ToSend), treat it as backpressure so a stuck socket
+            %% cannot loop forever.
+            UnsentSize = byte_size(Unsent),
+            Remainder = <<Unsent/binary, Rest/binary>>,
+            case UnsentSize < Chunk of
+                true ->
+                    ?TRACE("Partial send: unsent=~p of chunk=~p", [UnsentSize, Chunk]),
+                    receive after 10 -> ok end,
+                    do_send(Socket, Remainder, ChunkSize, 0);
+                false ->
+                    ?TRACE("Partial send made no progress (~p bytes)", [UnsentSize]),
+                    retry_send(Socket, Remainder, ChunkSize, Retries, no_progress, TotalSize)
+            end;
+        {error, Reason} when ?IS_TRANSIENT_SEND_ERROR(Reason) ->
+            %% Transient send-buffer backpressure (lwIP ERR_MEM -> eagain; or a
+            %% spurious closed on older AtomVM).  Retry with a short backoff and
+            %% only abandon the response once the bounded retry budget is spent.
+            retry_send(Socket, Packet, ChunkSize, Retries, Reason, TotalSize);
         {error, Reason} ->
-            %% Send buffer backpressure on ESP32/lwIP is reported as a transient
-            %% error (commonly {error, closed}) even though the connection is
-            %% still alive.  Retry with a short backoff; only abandon the
-            %% response once retries are exhausted (a truly-dead connection keeps
-            %% failing and we give up after the bounded budget).
-            retry_send(Socket, Packet, ChunkSize, Retries, Reason, TotalSize)
+            %% Genuine, non-transient failure (e.g. the peer really closed on a
+            %% patched AtomVM, or an invalid-argument error).  Give up now.
+            ?TRACE("Send failed permanently: ~p (remaining ~p)", [Reason, TotalSize]),
+            {error, Reason}
     end.
 
 %% @private

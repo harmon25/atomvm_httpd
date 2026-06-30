@@ -266,7 +266,10 @@ unmask_rem(<<B, C, D>>, K0, K1, K2, _, 3) -> <<(B bxor K0), (C bxor K1), (D bxor
 do_send(Socket, Packet, Mode) ->
     FramedPacket = frame(Packet, Mode),
     ?TRACE("Framed packet: [~s]", [atomvm_httpd:to_hex(FramedPacket)]),
-    socket:send(Socket, FramedPacket).
+    %% Route through tcp_server:send/2 so out-of-band WebSocket frames get the
+    %% same chunked, backpressure-aware (eagain/closed retry) send path as HTTP
+    %% responses instead of being silently dropped on transient send errors.
+    tcp_server:send(Socket, FramedPacket).
 
 %% @private
 frame(Packet, Mode) when is_list(Packet) ->

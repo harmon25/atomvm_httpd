@@ -84,6 +84,13 @@ defmodule HttpdDebug do
          handler_config: %{module: HttpdDebug.DebugApiHandler}
        }},
 
+      # WebSocket stress endpoint at /ws (echo + gen:N pattern)
+      {[<<"ws">>],
+       %{
+         handler: :httpd_ws_handler,
+         handler_config: %{module: HttpdDebug.WsEchoHandler}
+       }},
+
       # Static file handler for test dashboard (catch-all)
       {[],
        %{

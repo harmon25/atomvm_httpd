@@ -217,10 +217,42 @@ defmodule TcpServerTest do
     end
   end
 
+  describe "bounded iodata chunking" do
+    test "preserves deeply nested mixed iodata across byte boundaries" do
+      data = [<<"ab">>, [99, [<<"defgh">>, []]], [105 | <<"jkl">>]]
+
+      chunks = collect_chunks(data, 4)
+
+      assert Enum.all?(chunks, fn chunk -> :erlang.iolist_size(chunk) <= 4 end)
+      assert :erlang.iolist_to_binary(chunks) == "abcdefghijkl"
+    end
+
+    test "bounds temporary entries for many one-byte elements" do
+      data = List.duplicate(?x, 1_000)
+      [first | _] = chunks = collect_chunks(data, 4_096)
+
+      assert length(first) == 64
+      assert Enum.all?(chunks, fn chunk -> length(chunk) <= 64 end)
+      assert :erlang.iolist_to_binary(chunks) == :binary.copy("x", 1_000)
+    end
+
+    test "rejects invalid iodata and chunk sizes" do
+      assert catch_error(:tcp_server.next_chunk([256], 32)) == :badarg
+      assert catch_error(:tcp_server.next_chunk("ok", 0)) == :badarg
+    end
+  end
+
   ## helpers
 
   defp connect(port) do
     :gen_tcp.connect(~c"localhost", port, [:binary, active: false, packet: :raw])
+  end
+
+  defp collect_chunks(iodata, chunk_size, acc \\ []) do
+    case :tcp_server.next_chunk(iodata, chunk_size) do
+      :done -> Enum.reverse(acc)
+      {chunk, rest} -> collect_chunks(rest, chunk_size, [chunk | acc])
+    end
   end
 
   defp find_free_tcp_port do

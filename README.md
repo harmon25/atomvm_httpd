@@ -102,7 +102,7 @@ WiFi.
 ### Chunked sending with backpressure retry
 
 Responses are sent in `chunk_size` slices (default 4096 bytes) via
-`tcp_server:do_send/3`, which runs in the worker so blocking is fine. Nested
+`tcp_server:send/3`, which runs in the worker so blocking is fine. Nested
 iodata is consumed incrementally rather than flattened into one response-sized
 binary. The temporary chunk is bounded by both `chunk_size` and an internal
 iodata-entry limit, keeping peak send memory independent of total response size.

@@ -415,9 +415,10 @@ do_send_iodata(Socket, Packet, ChunkSize) ->
                 ok ->
                     case Rest of
                         [] -> ok;
-                        _ -> receive after 0 -> ok end
-                    end,
-                    do_send_iodata(Socket, Rest, ChunkSize);
+                        _ ->
+                            receive after 0 -> ok end,
+                            do_send_iodata(Socket, Rest, ChunkSize)
+                    end;
                 {error, _Reason} = Error ->
                     Error
             end

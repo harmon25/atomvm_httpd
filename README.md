@@ -102,7 +102,11 @@ WiFi.
 ### Chunked sending with backpressure retry
 
 Responses are sent in `chunk_size` slices (default 4096 bytes) via
-`tcp_server:do_send/3`, which runs in the worker so blocking is fine. On ESP32 the
+`tcp_server:send/3`, which runs in the worker so blocking is fine. Nested
+iodata is consumed incrementally rather than flattened into one response-sized
+binary. The temporary chunk is bounded by both `chunk_size` and an internal
+iodata-entry limit, keeping peak send memory independent of total response size.
+On ESP32 the
 lwIP TCP **send buffer is small** (a few KB — roughly `4 × TCP_MSS`), so a single
 large response is many times the buffer size and must be paced:
 
@@ -114,6 +118,8 @@ large response is many times the buffer size and must be paced:
 - `do_send` therefore **retries a failed chunk** with a short backoff (bounded —
   see `MAX_SEND_RETRIES`), only abandoning the response once retries are
   exhausted. A genuinely-dead connection keeps failing and is given up cleanly.
+- Partial sends retry only the unsent portion of the current bounded chunk; they
+  do not concatenate it with the rest of the response.
 
 This retry is the difference between large responses (e.g. 64 KB) truncating a
 large fraction of the time under concurrency versus completing reliably. Tune

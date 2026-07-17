@@ -39,6 +39,10 @@
 
 -export([start/3, start/4, start_link/3, start_link/4, stop/1, send/3]).
 
+-ifdef(TEST).
+-export([next_chunk/2]).
+-endif.
+
 -behaviour(gen_server).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -90,6 +94,10 @@
 %% Default send-chunk size.  Matches gen_tcp_server: a comfortable fit within
 %% the ESP32 lwIP send buffer.
 -define(DEFAULT_SEND_CHUNK, 4096).
+%% Bound the temporary list used to coalesce small iodata leaves.  A byte limit
+%% alone is not enough: a JSON response can contain thousands of one-byte
+%% punctuation elements, each of which occupies a cons cell.
+-define(MAX_CHUNK_ENTRIES, 64).
 %% Application-level keys (chunk_size, max_connections, recv_timeout) ride in
 %% the SocketOptions map but must never reach socket:setopt/3.  They are
 %% stripped with nested maps:remove/2 in init/1 — AtomVM's maps module does not
@@ -392,47 +400,102 @@ call_handle_info(Protocol, Msg, State) ->
 -define(MAX_SEND_RETRIES, 50).
 
 do_send(Socket, Packet, ChunkSize) ->
-    do_send(Socket, Packet, ChunkSize, 0).
+    do_send_iodata(Socket, Packet, ChunkSize).
 
-do_send(_Socket, <<>>, _ChunkSize, _Retries) ->
-    ok;
-do_send(Socket, Packet, ChunkSize, Retries) when is_list(Packet) ->
-    do_send(Socket, erlang:iolist_to_binary(Packet), ChunkSize, Retries);
-do_send(Socket, Packet, ChunkSize, Retries) when is_binary(Packet) ->
-    TotalSize = byte_size(Packet),
-    Chunk = erlang:min(TotalSize, ChunkSize),
-    <<ToSend:Chunk/binary, Rest/binary>> = Packet,
-    case socket:send(Socket, ToSend) of
-        ok ->
-            case byte_size(Rest) > 0 of
-                true -> receive after 0 -> ok end;
-                false -> ok
-            end,
-            do_send(Socket, Rest, ChunkSize, 0);
-        {ok, Unsent} ->
-            %% Partial send: lwIP send buffer full / TCP_MSS cap.  Yield to let
-            %% the stack drain, then retry the remainder.
-            ?TRACE("Partial send: unsent=~p remaining=~p", [byte_size(Unsent), TotalSize]),
-            receive after 10 -> ok end,
-            do_send(Socket, <<Unsent/binary, Rest/binary>>, ChunkSize, 0);
-        {error, Reason} ->
-            %% Send buffer backpressure on ESP32/lwIP is reported as a transient
-            %% error (commonly {error, closed}) even though the connection is
-            %% still alive.  Retry with a short backoff; only abandon the
-            %% response once retries are exhausted (a truly-dead connection keeps
-            %% failing and we give up after the bounded budget).
-            retry_send(Socket, Packet, ChunkSize, Retries, Reason, TotalSize)
+%% Walk nested iodata incrementally instead of flattening the complete response.
+%% next_chunk/2 bounds both bytes and list entries, so peak temporary memory is
+%% independent of the total response size.
+do_send_iodata(Socket, Packet, ChunkSize) ->
+    case next_chunk(Packet, ChunkSize) of
+        done ->
+            ok;
+        {Chunk, Rest} ->
+            ToSend = chunk_to_binary(Chunk),
+            case send_chunk(Socket, ToSend, 0) of
+                ok ->
+                    case Rest of
+                        [] -> ok;
+                        _ ->
+                            receive after 0 -> ok end,
+                            do_send_iodata(Socket, Rest, ChunkSize)
+                    end;
+                {error, _Reason} = Error ->
+                    Error
+            end
     end.
 
 %% @private
-retry_send(_Socket, _Packet, _ChunkSize, Retries, Reason, _TotalSize)
-        when Retries >= ?MAX_SEND_RETRIES ->
-    ?TRACE("Send giving up after ~p retries: ~p (remaining ~p)", [Retries, Reason, _TotalSize]),
+next_chunk(Iodata, ChunkSize) when is_integer(ChunkSize) andalso ChunkSize > 0 ->
+    take_chunk([Iodata], ChunkSize, ?MAX_CHUNK_ENTRIES, []);
+next_chunk(_Iodata, _ChunkSize) ->
+    erlang:error(badarg).
+
+take_chunk([], _BytesLeft, _EntriesLeft, []) ->
+    done;
+take_chunk([], _BytesLeft, _EntriesLeft, Acc) ->
+    {lists:reverse(Acc), []};
+take_chunk(Pending, 0, _EntriesLeft, Acc) ->
+    {lists:reverse(Acc), Pending};
+take_chunk(Pending, _BytesLeft, 0, Acc) ->
+    {lists:reverse(Acc), Pending};
+take_chunk([[] | Rest], BytesLeft, EntriesLeft, Acc) ->
+    take_chunk(Rest, BytesLeft, EntriesLeft, Acc);
+take_chunk([Byte | Rest], BytesLeft, EntriesLeft, Acc)
+        when is_integer(Byte) andalso Byte >= 0 andalso Byte =< 255 ->
+    take_chunk(Rest, BytesLeft - 1, EntriesLeft - 1, [Byte | Acc]);
+take_chunk([Bin | Rest], BytesLeft, EntriesLeft, Acc) when is_binary(Bin) ->
+    Size = byte_size(Bin),
+    case Size of
+        0 ->
+            take_chunk(Rest, BytesLeft, EntriesLeft, Acc);
+        _ when Size =< BytesLeft ->
+            take_chunk(Rest, BytesLeft - Size, EntriesLeft - 1, [Bin | Acc]);
+        _ ->
+            <<Part:BytesLeft/binary, Remaining/binary>> = Bin,
+            {lists:reverse([Part | Acc]), [Remaining | Rest]}
+    end;
+take_chunk([[Head | Tail] | Rest], BytesLeft, EntriesLeft, Acc) ->
+    take_chunk([Head, Tail | Rest], BytesLeft, EntriesLeft, Acc);
+take_chunk(_Pending, _BytesLeft, _EntriesLeft, _Acc) ->
+    erlang:error(badarg).
+
+%% Avoid copying when a chunk is already represented by one binary leaf.
+chunk_to_binary([Bin]) when is_binary(Bin) ->
+    Bin;
+chunk_to_binary(Chunk) ->
+    erlang:iolist_to_binary(Chunk).
+
+send_chunk(_Socket, <<>>, _Retries) ->
+    ok;
+send_chunk(Socket, Chunk, Retries) ->
+    case socket:send(Socket, Chunk) of
+        ok ->
+            ok;
+        {ok, <<>>} ->
+            ok;
+        {ok, Unsent} ->
+            %% Retry only the unsent part of this bounded chunk.  The remaining
+            %% response stays in its iodata traversal stack and is never copied
+            %% together with Unsent.
+            ?TRACE("Partial send: unsent=~p chunk=~p", [byte_size(Unsent), byte_size(Chunk)]),
+            receive after 10 -> ok end,
+            send_chunk(Socket, Unsent, 0);
+        {error, Reason} ->
+            %% Send buffer backpressure on ESP32/lwIP is reported as a transient
+            %% error (commonly {error, closed}) even though the connection is
+            %% still alive.  Retry with a short backoff; only abandon the chunk
+            %% once retries are exhausted.
+            retry_send_chunk(Socket, Chunk, Retries, Reason)
+    end.
+
+%% @private
+retry_send_chunk(_Socket, _Chunk, Retries, Reason) when Retries >= ?MAX_SEND_RETRIES ->
+    ?TRACE("Send giving up after ~p retries: ~p (chunk ~p)", [Retries, Reason, byte_size(_Chunk)]),
     {error, Reason};
-retry_send(Socket, Packet, ChunkSize, Retries, _Reason, _TotalSize) ->
-    ?TRACE("Send error ~p; retry ~p (remaining ~p)", [_Reason, Retries, _TotalSize]),
+retry_send_chunk(Socket, Chunk, Retries, _Reason) ->
+    ?TRACE("Send error ~p; retry ~p (chunk ~p)", [_Reason, Retries, byte_size(Chunk)]),
     receive after 10 -> ok end,
-    do_send(Socket, Packet, ChunkSize, Retries + 1).
+    send_chunk(Socket, Chunk, Retries + 1).
 
 %% @private
 try_close(Socket) ->

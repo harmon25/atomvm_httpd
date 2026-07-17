@@ -113,6 +113,10 @@ handle_api_request(_M, _P, _R, _A) ->
     given up after the bounded budget.
 - Responses are sent in `chunk_size` slices (default 4096; configurable per server). lwIP
   accepts at most `TCP_MSS` (~1440 B) per `socket:send`, so larger chunks just loop internally.
+- Never flatten a complete response with `iolist_to_binary/1`. `tcp_server` walks nested
+  iodata into chunks bounded by both byte size and entry count, and partial sends retry only
+  the unsent part of the current chunk. This is required to avoid response-sized allocations
+  and heap fragmentation on memory-constrained devices.
 - No `priv/` in this repo; `httpd_file_handler` serves from a *consumer* app's `priv`.
 
 ## Testing

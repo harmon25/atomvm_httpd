@@ -393,6 +393,8 @@ With this example configuration, an HTTP request with the path `/index.html` wil
 
 The file handler replies with `{reply, ...}`, so an HTTP/1.1 client (which is persistent by default) can reuse the same connection to fetch the rest of the page's assets — CSS, Javascript and images — without a new TCP handshake. `Connection: close` and HTTP/1.0 clients are still closed after the response.
 
+Pre-compressed assets are served automatically: if the request's `Accept-Encoding` (case-insensitive) contains `gzip` and a `<path>.gz` file is embedded alongside the original, the handler sends the compressed bytes with `Content-Encoding: gzip` (and the `Content-Type` of the *original* file). Otherwise it falls back to the uncompressed file, so a `.gz` variant is purely an optimization — for example, embed `priv/js/app.js` and `priv/js/app.js.gz` to have browsers download the smaller asset when they advertise gzip support.
+
 > Note. The retrieval of file data from AVM files is generally quite efficient, with minimal impact on RAM resources on an ESP32 device. In general you should not be limited by file sizes, except for the spaced used by your AVM file and network overhead associated with the transfer of the file data to the HTTP client.
 
 #### A Special Note about Paths
@@ -688,7 +690,7 @@ TODO
 
 # Examples
 
-Two runnable example applications live under [`examples/`](./examples):
+Runnable example applications live under [`examples/`](./examples):
 
 - **[`examples/httpd_debug`](./examples/httpd_debug)** — a full debug/stress-test
   HTTP application for ESP32: WiFi STA, debug + stats API endpoints, a browser
@@ -696,6 +698,15 @@ Two runnable example applications live under [`examples/`](./examples):
   (see its [README](./examples/httpd_debug/README.md) and
   [SOAK.md](./examples/httpd_debug/SOAK.md)). This is the best starting point for
   exercising the server on real hardware.
+- **[`examples/elixir_http`](./examples/elixir_http)** — an Elixir application
+  serving a static dashboard, a JSON system/memory API (`/api/*`) and live memory
+  updates over a WebSocket (`/ws`), built with
+  [ExAtomVM](https://github.com/atomvm/exatomvm). See its
+  [README](./examples/elixir_http/README.md).
+- **[`examples/erlang_http`](./examples/erlang_http)** — the Erlang equivalent:
+  the same dashboard and API/WebSocket endpoints, plus OTA firmware upload at
+  `/ota`, built with `rebar3` and the AtomVM rebar3 plugin. See its
+  [README](./examples/erlang_http/README.md).
 - **[`examples/tcp_echo`](./examples/tcp_echo)** — a minimal standalone
   `tcp_server` protocol (echo) demonstrating the per-connection TCP server layer
   on its own, without HTTP. See its [README](./examples/tcp_echo/README.md).

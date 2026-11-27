@@ -408,6 +408,160 @@ defmodule HttpdIntegrationTest do
     end
   end
 
+  describe "httpd_file_handler gzip support" do
+    @gz_body :binary.copy("g", 128)
+    @plain_index "<html>index</html>"
+    @plain_js "console.log('plain');"
+
+    setup do
+      :atomvm.reset_priv()
+
+      :atomvm.put_priv(:test_app, "index.html.gz", @gz_body)
+      :atomvm.put_priv(:test_app, "index.html", @plain_index)
+      :atomvm.put_priv(:test_app, "js/app.js.gz", @gz_body)
+      :atomvm.put_priv(:test_app, "js/app.js", @plain_js)
+      :atomvm.put_priv(:test_app, "css/style.css", "body{}")
+
+      port = find_free_tcp_port()
+
+      config = [
+        {[], %{handler: :httpd_file_handler, handler_config: %{app: :test_app}}}
+      ]
+
+      {:ok, server} = :httpd.start_link(port, config)
+      Process.sleep(20)
+
+      on_exit(fn ->
+        :atomvm.reset_priv()
+        safe_stop(server)
+      end)
+
+      {:ok, port: port}
+    end
+
+    test "serves pre-compressed .gz assets when the client accepts gzip", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "GET /js/app.js HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip, deflate\r\n\r\n"
+          )
+
+        assert {:ok, response} = recv_one_response(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+        assert response =~ "content-encoding: gzip"
+        assert response =~ "content-type: text/javascript"
+
+        [_headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+        assert byte_size(body) == byte_size(@gz_body)
+
+        # Connection stays open for a subsequent keep-alive request.
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "GET / HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip\r\n\r\n"
+          )
+
+        assert {:ok, response2} = recv_one_response(socket)
+        assert response2 =~ "HTTP/1.1 200 OK"
+        assert response2 =~ "content-encoding: gzip"
+        assert response2 =~ "content-type: text/html"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "serves compressed assets for mixed-case Accept-Encoding with Connection: close", %{
+      port: port
+    } do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "GET /js/app.js HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: GZip\r\nConnection: close\r\n\r\n"
+          )
+
+        # recv_all/1 returns once the server closes the socket, so a clean close
+        # (rather than a timeout) proves Connection: close was honoured.
+        assert {:ok, response} = recv_all(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+        assert response =~ "content-encoding: gzip"
+        assert response =~ "content-type: text/javascript"
+
+        [_headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+        assert body == @gz_body
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "falls back to the uncompressed file when no .gz exists", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "GET /css/style.css HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip\r\n\r\n"
+          )
+
+        assert {:ok, response} = recv_one_response(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+        assert response =~ "content-type: text/css"
+        refute response =~ "content-encoding"
+
+        [_headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+        assert body == "body{}"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "serves the uncompressed file when the client does not accept gzip", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "GET /js/app.js HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: identity\r\n\r\n"
+          )
+
+        assert {:ok, response} = recv_one_response(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+        assert response =~ "content-type: text/javascript"
+        refute response =~ "content-encoding"
+
+        [_headers, body] = :binary.split(response, <<"\r\n\r\n">>)
+        assert body == @plain_js
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "returns 404 when neither the file nor its .gz exists", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "GET /missing.js HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip\r\n\r\n"
+          )
+
+        assert {:ok, response} = recv_one_response(socket)
+        assert response =~ "404"
+        assert response =~ "not_found"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+  end
+
   describe "request timeout" do
     # A deliberately short timeout so tests finish quickly.
     @timeout_ms 300
@@ -415,7 +569,10 @@ defmodule HttpdIntegrationTest do
     # Start a second httpd with the short timeout; override :port in context.
     setup do
       port = find_free_tcp_port()
-      config = [{[], %{handler: TestEchoHandler, handler_config: %{test_pid: self()}}}]
+
+      config = [
+        {[], %{handler: TestEchoHandler, handler_config: %{test_pid: self(), reply_mode: :reply}}}
+      ]
 
       {:ok, server} =
         :httpd.start_link(:any, port, %{}, %{request_timeout: @timeout_ms}, config)
@@ -454,6 +611,26 @@ defmodule HttpdIntegrationTest do
       Process.sleep(@timeout_ms + 200)
       assert {:error, :closed} = :gen_tcp.recv(socket, 0, 500)
       :gen_tcp.close(socket)
+    end
+
+    test "does not close an idle keep-alive connection", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        assert {:ok, response} = recv_one_response(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+
+        # No request is in flight, so the request timer firing must not close
+        # the connection (HTTP/1.1 keep-alive).
+        Process.sleep(@timeout_ms + 200)
+
+        :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        assert {:ok, response2} = recv_one_response(socket)
+        assert response2 =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+      end
     end
   end
 

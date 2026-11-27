@@ -60,11 +60,96 @@ defmodule AtomvmHttpd do
   end
 
   @doc """
+  Starts an HTTP server linked to the current process, binding to a specific
+  address with custom socket options.
+
+  ## Parameters
+
+  - `address` - `:any`, `:loopback`, or an IPv4 tuple like `{192, 168, 1, 1}`
+  - `port` - The TCP port to listen on
+  - `socket_options` - A map of socket/server options (e.g. `%{chunk_size: 8192}`)
+  - `config` - A list of path/handler configurations
+  """
+  @spec start_link(:any | :loopback | tuple(), port_number(), map(), config()) ::
+          {:ok, pid()} | {:error, term()}
+  def start_link(address, port, socket_options, config) do
+    :httpd.start_link(address, port, socket_options, config)
+  end
+
+  @doc """
+  Starts an HTTP server linked to the current process, binding to a specific
+  address with custom socket options and server options.
+
+  ## Parameters
+
+  - `address` - `:any`, `:loopback`, or an IPv4 tuple like `{192, 168, 1, 1}`
+  - `port` - The TCP port to listen on
+  - `socket_options` - A map of socket/server options (e.g. `%{chunk_size: 8192}`)
+  - `options` - A map of server options (e.g. `%{request_timeout: 30_000}`)
+  - `config` - A list of path/handler configurations
+  """
+  @spec start_link(:any | :loopback | tuple(), port_number(), map(), map(), config()) ::
+          {:ok, pid()} | {:error, term()}
+  def start_link(address, port, socket_options, options, config) do
+    :httpd.start_link(address, port, socket_options, options, config)
+  end
+
+  @doc """
   Starts an HTTP server (not linked).
   """
   @spec start(port_number(), config()) :: {:ok, pid()} | {:error, term()}
   def start(port, config) do
     :httpd.start(port, config)
+  end
+
+  @doc """
+  Starts an HTTP server (not linked), binding to a specific address.
+
+  ## Parameters
+
+  - `address` - `:any`, `:loopback`, or an IPv4 tuple like `{192, 168, 1, 1}`
+  - `port` - The TCP port to listen on
+  - `config` - A list of path/handler configurations
+  """
+  @spec start(:any | :loopback | tuple(), port_number(), config()) ::
+          {:ok, pid()} | {:error, term()}
+  def start(address, port, config) do
+    :httpd.start(address, port, config)
+  end
+
+  @doc """
+  Starts an HTTP server (not linked), binding to a specific address with custom
+  socket options.
+
+  ## Parameters
+
+  - `address` - `:any`, `:loopback`, or an IPv4 tuple like `{192, 168, 1, 1}`
+  - `port` - The TCP port to listen on
+  - `socket_options` - A map of socket/server options (e.g. `%{chunk_size: 8192}`)
+  - `config` - A list of path/handler configurations
+  """
+  @spec start(:any | :loopback | tuple(), port_number(), map(), config()) ::
+          {:ok, pid()} | {:error, term()}
+  def start(address, port, socket_options, config) do
+    :httpd.start(address, port, socket_options, config)
+  end
+
+  @doc """
+  Starts an HTTP server (not linked), binding to a specific address with custom
+  socket options and server options.
+
+  ## Parameters
+
+  - `address` - `:any`, `:loopback`, or an IPv4 tuple like `{192, 168, 1, 1}`
+  - `port` - The TCP port to listen on
+  - `socket_options` - A map of socket/server options (e.g. `%{chunk_size: 8192}`)
+  - `options` - A map of server options (e.g. `%{request_timeout: 30_000}`)
+  - `config` - A list of path/handler configurations
+  """
+  @spec start(:any | :loopback | tuple(), port_number(), map(), map(), config()) ::
+          {:ok, pid()} | {:error, term()}
+  def start(address, port, socket_options, options, config) do
+    :httpd.start(address, port, socket_options, options, config)
   end
 
   @doc """

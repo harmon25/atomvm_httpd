@@ -150,8 +150,8 @@ handle_data(Packet, #state{ws = undefined} = State) ->
     try
         handle_http_request(Packet, State)
     catch
-        A:E:S ->
-            io:format("Caught error: ~p:~p:~p~n", [A, E, S]),
+        _A:E:_S ->
+            ?TRACE("Caught error: ~p:~p:~p", [_A, E, _S]),
             {send_close, create_error(?BAD_REQUEST, E)}
     end;
 handle_data(Packet, #state{ws = WebSocket} = State) ->
@@ -171,8 +171,12 @@ handle_http_request(Packet, State) ->
             case maybe_parse_http_request(AccumulatedPacket) of
                 {more, IncompletePacket} ->
                     {continue, State#state{buffer = IncompletePacket}};
-                {ok, HttpRequest} ->
-                    CleanState = State#state{buffer = <<>>},
+                {ok, ParsedRequest} ->
+                    %% Any bytes after this request's declared body belong to a
+                    %% pipelined request; keep them in the connection buffer
+                    %% instead of mis-attributing them to this request's body.
+                    {HttpRequest, Extra} = extract_pipelined_bytes(ParsedRequest),
+                    CleanState = State#state{buffer = Extra},
                     #{
                         method := Method,
                         headers := Headers
@@ -193,10 +197,91 @@ handle_http_request(Packet, State) ->
             end;
         PendingHttpRequest ->
             ?TRACE("Packetlen: ~p", [erlang:byte_size(Packet)]),
-            ExistingBody = maps:get(body, PendingHttpRequest, <<>>),
-            NewBody = <<ExistingBody/binary, Packet/binary>>,
-            CleanState = State#state{buffer = <<>>},
-            handle_request_state(PendingHttpRequest#{body := NewBody}, CleanState)
+            accumulate_pending_body(PendingHttpRequest, Packet, State)
+    end.
+
+%% @private
+%% Accumulate body bytes for an in-flight request without re-concatenating the
+%% whole body on every TCP segment (which is O(N^2) in the number of segments).
+%% Chunks are kept in reverse order plus a running length, and flattened exactly
+%% once when the declared Content-Length has been reached.
+accumulate_pending_body(PendingHttpRequest, Packet, State) ->
+    ExistingBody = maps:get(body, PendingHttpRequest, <<>>),
+    Chunks = maps:get(body_chunks, PendingHttpRequest, [ExistingBody]),
+    BodyLen = maps:get(body_len, PendingHttpRequest, erlang:byte_size(ExistingBody)),
+    NewChunks = [Packet | Chunks],
+    NewBodyLen = BodyLen + erlang:byte_size(Packet),
+    case content_length(PendingHttpRequest) of
+        undefined ->
+            %% No declared length: the request was already complete, so the
+            %% accumulated bytes are the body.
+            Body = erlang:iolist_to_binary(lists:reverse(NewChunks)),
+            handle_request_state(
+                PendingHttpRequest#{body := Body, body_chunks => [], body_len => NewBodyLen},
+                State#state{buffer = <<>>}
+            );
+        ContentLen when NewBodyLen < ContentLen ->
+            {continue, State#state{
+                pending_request = PendingHttpRequest#{
+                    body := <<>>,
+                    body_chunks => NewChunks,
+                    body_len => NewBodyLen
+                },
+                buffer = <<>>
+            }};
+        ContentLen ->
+            AllBytes = erlang:iolist_to_binary(lists:reverse(NewChunks)),
+            {Body, Extra} = split_body(AllBytes, ContentLen),
+            handle_request_state(
+                PendingHttpRequest#{
+                    body := Body,
+                    body_chunks => [],
+                    body_len => erlang:byte_size(Body)
+                },
+                State#state{buffer = Extra}
+            )
+    end.
+
+%% @private
+%% Slice the exact request body out of the accumulated bytes, preserving any
+%% extra (pipelined) bytes so they can be parsed as the next request.
+split_body(AllBytes, ContentLen) ->
+    case erlang:byte_size(AllBytes) > ContentLen of
+        true ->
+            <<ExactBody:ContentLen/binary, Extra/binary>> = AllBytes,
+            {ExactBody, Extra};
+        false ->
+            {AllBytes, <<>>}
+    end.
+
+%% @private
+extract_pipelined_bytes(HttpRequest) ->
+    Body = maps:get(body, HttpRequest, <<>>),
+    case content_length(HttpRequest) of
+        undefined ->
+            case Body of
+                <<>> -> {HttpRequest, <<>>};
+                _ -> {HttpRequest#{body := <<>>}, Body}
+            end;
+        ContentLen when ContentLen >= 0 ->
+            case erlang:byte_size(Body) > ContentLen of
+                true ->
+                    {ExactBody, Extra} = split_body(Body, ContentLen),
+                    {HttpRequest#{body := ExactBody}, Extra};
+                false ->
+                    {HttpRequest, <<>>}
+            end;
+        _ ->
+            {HttpRequest, <<>>}
+    end.
+
+%% @private
+content_length(HttpRequest) ->
+    Headers = maps:get(headers, HttpRequest, #{}),
+    case maps:get(<<"content-length">>, Headers, undefined) of
+        undefined -> undefined;
+        ContentLenBin when is_binary(ContentLenBin) -> binary_to_integer(ContentLenBin);
+        ContentLen when is_integer(ContentLen) -> ContentLen
     end.
 
 %% @private
@@ -296,11 +381,9 @@ get_request_state(HttpRequest) ->
                     ?TRACE("No content length; request complete", []),
                     complete;
                 ContentLenBin when is_binary(ContentLenBin) ->
-                    ContentLen = binary_to_integer(ContentLenBin),
-                    ?TRACE("ContentLen: ~p", [ContentLen]),
-                    Body = maps:get(body, HttpRequest, <<"">>),
-                    BodyLen = erlang:byte_size(Body),
-                    ?TRACE("BodyLen: ~p", [BodyLen]),
+                    ContentLen = request_content_length(ContentLenBin),
+                    BodyLen = request_body_len(HttpRequest),
+                    ?TRACE("ContentLen: ~p BodyLen: ~p", [ContentLen, BodyLen]),
                     case BodyLen < ContentLen of
                         true ->
                             wait_for_body;
@@ -310,6 +393,25 @@ get_request_state(HttpRequest) ->
                     end
             end
     end.
+
+%% @private
+%% A Content-Length must be a non-negative integer; anything else is a bad
+%% request (the caller turns the throw/error into a 400 response).
+request_content_length(ContentLenBin) ->
+    case binary_to_integer(ContentLenBin) of
+        ContentLen when ContentLen >= 0 ->
+            ContentLen;
+        _ ->
+            throw(bad_content_length)
+    end.
+
+%% @private
+%% Prefer the running body length tracked while accumulating chunks; fall back
+%% to the body binary for requests supplied directly (e.g. by callers/tests).
+request_body_len(#{body_len := BodyLen}) when is_integer(BodyLen) ->
+    BodyLen;
+request_body_len(HttpRequest) ->
+    erlang:byte_size(maps:get(body, HttpRequest, <<>>)).
 
 %% @private
 call_http_req_handler(HttpRequest, State) ->
@@ -323,17 +425,19 @@ call_http_req_handler(HttpRequest, State) ->
         %% appended to its body rather than parsed as a fresh request.
         {noreply, NewHandlerState} ->
             {continue, State#state{pending_request = HttpRequest#{handler_state := NewHandlerState}}};
-        %% reply — send the response and keep the connection open for the next
-        %% request (keep-alive).  pending_request is cleared so the next packet
-        %% is parsed fresh.
-        %% NOTE: HTTP/1.0 default-close and Connection: close semantics are not yet
-        %% implemented; that negotiation is deferred to a follow-up.  Handlers that
-        %% need to force a close should return {close, ...} instead.
+        %% reply — send the response, then keep the connection open only if the
+        %% client asked for it (HTTP/1.1 default; HTTP/1.0 needs an explicit
+        %% Connection: keep-alive, and Connection: close always wins).
         {reply, Reply, _NewHandlerState} ->
-            {send, create_reply(?OK, #{"Content-Type" => "application/octet-stream"}, Reply),
-                State#state{pending_request = undefined}};
+            send_reply(
+                ?OK,
+                #{"Content-Type" => "application/octet-stream"},
+                Reply,
+                HttpRequest,
+                State
+            );
         {reply, ReplyHeaders, Reply, _NewHandlerState} ->
-            {send, create_reply(?OK, ReplyHeaders, Reply), State#state{pending_request = undefined}};
+            send_reply(?OK, ReplyHeaders, Reply, HttpRequest, State);
         %% close — handler explicitly requests connection close; always honour it
         %% regardless of the client's keep-alive preference, preserving the documented
         %% httpd_handler contract that {close, ...} means "send response, close connection".
@@ -352,6 +456,32 @@ call_http_req_handler(HttpRequest, State) ->
             {send_close, create_error(?INTERNAL_SERVER_ERROR, internal_server_error)};
         HandlerError ->
             {send_close, create_error(?INTERNAL_SERVER_ERROR, HandlerError)}
+    end.
+
+%% @private
+send_reply(StatusCode, Headers, Reply, HttpRequest, State) ->
+    Response = create_reply(StatusCode, Headers, Reply),
+    NewState = State#state{pending_request = undefined},
+    case is_keep_alive(HttpRequest) of
+        true ->
+            {send, Response, NewState};
+        false ->
+            {send_close, Response}
+    end.
+
+%% @private
+%% HTTP/1.1 connections are persistent unless the client sends
+%% `Connection: close'; HTTP/1.0 connections are closed unless the client sends
+%% `Connection: keep-alive'.  Header values are matched case-insensitively.
+is_keep_alive(HttpRequest) ->
+    Headers = maps:get(headers, HttpRequest, #{}),
+    Version = maps:get(version, HttpRequest, <<"HTTP/1.0">>),
+    Connection = ascii_lower_bin(maps:get(<<"connection">>, Headers, <<>>)),
+    case Version of
+        <<"HTTP/1.1">> ->
+            binary:match(Connection, <<"close">>) =:= nomatch;
+        _ ->
+            binary:match(Connection, <<"keep-alive">>) =/= nomatch
     end.
 
 %% @hidden
@@ -394,9 +524,19 @@ get_reply_token(WebSocketKey) ->
     ReplyToken.
 
 %% @private
-parse_http_request(HeadingList, Body) ->
-    {Heading, _HeadingRest} = parse_heading(HeadingList, start, [], #{}),
-    {Headers, _} = parse_header(_HeadingRest, #{}),
+%% Parse a complete request head (the bytes before the blank line) together
+%% with the body bytes that followed it.  Parsing happens directly on binaries:
+%% the header block is never converted wholesale to a charlist.
+parse_http_request(HeaderBlock, Body) ->
+    {RequestLine, HeaderLines} =
+        case binary:split(HeaderBlock, <<"\n">>, [global]) of
+            [FirstLine | Rest] ->
+                {strip_cr(FirstLine), Rest};
+            [] ->
+                throw(bad_heading)
+        end,
+    Heading = parse_request_line(RequestLine),
+    Headers = parse_header_lines(HeaderLines, #{}),
     maps:merge(
         Heading,
         #{
@@ -411,9 +551,8 @@ maybe_parse_http_request(Packet) when is_binary(Packet) ->
             {more, Packet};
         {Pos, Len} ->
             try
-                HeaderEnd = Pos + Len,
-                <<HeadingPart:HeaderEnd/binary, Body/binary>> = Packet,
-                {ok, parse_http_request(binary_to_list(HeadingPart), Body)}
+                <<HeaderBlock:Pos/binary, _Delimiter:Len/binary, Body/binary>> = Packet,
+                {ok, parse_http_request(HeaderBlock, Body)}
             catch
                 throw:Reason ->
                     {error, Reason};
@@ -431,154 +570,187 @@ find_header_delimiter(Packet) ->
     end.
 
 %% @private
-parse_heading([$\s|Rest], start, Tmp, Accum) ->
-    parse_heading(Rest, start, Tmp, Accum);
-parse_heading(Packet, start, Tmp, Accum) ->
-    parse_heading(Packet, in_method, Tmp, Accum);
-parse_heading([$\s|Rest], in_method, Tmp, Accum) ->
-    Method = method_to_atom(string:to_upper(lists:reverse(Tmp))),
-    parse_heading(Rest, wait_uri, [], Accum#{method => Method});
-parse_heading([C|Rest], in_method, Tmp, Accum) ->
-    parse_heading(Rest, in_method, [C|Tmp], Accum);
-%% wait_uri state
-parse_heading([$\s|Rest], wait_uri, Tmp, Accum) ->
-    parse_heading(Rest, wait_uri, Tmp, Accum);
-parse_heading(Packet, wait_uri, Tmp, Accum) ->
-    parse_heading(Packet, in_uri, Tmp, Accum);
-%% in_uri state
-parse_heading([$\s|Rest], in_uri, Tmp, Accum) ->
-    Uri = lists:reverse(Tmp),
-    {Path, QueryParams} = normalize_uri(Uri),
-    parse_heading(Rest, wait_version, [], Accum#{uri => Uri, path => Path, query_params => QueryParams});
-parse_heading([C|Rest], in_uri, Tmp, Accum) ->
-    parse_heading(Rest, in_uri, [C|Tmp], Accum);
-%% wait_version state
-parse_heading([$\s|Rest], wait_version, Tmp, Accum) ->
-    parse_heading(Rest, wait_version, Tmp, Accum);
-parse_heading(Packet, wait_version, Tmp, Accum) ->
-    parse_heading(Packet, in_version, Tmp, Accum);
-%% in_version state
-parse_heading([$\n|Rest], in_version, Tmp, Accum) ->
-    RawVersion = lists:reverse(Tmp),
-    Version = case RawVersion of
-        [$\r | Clean] -> list_to_binary(Clean);
-        _ -> list_to_binary(RawVersion)
-    end,
-    {Accum#{version => Version}, Rest};
-parse_heading([C|Rest], in_version, Tmp, Accum) ->
-    parse_heading(Rest, in_version, [C|Tmp], Accum);
-%% error state
-parse_heading(_Packet, _State, _Tmp, _Accum) ->
-    throw(bad_heading).
+%% `Method SP Uri SP Version'.  Multiple and/or leading spaces are tolerated.
+parse_request_line(<<>>) ->
+    throw(bad_heading);
+parse_request_line(Line) ->
+    Tokens = [Token || Token <- binary:split(Line, <<" ">>, [global]), Token =/= <<>>],
+    case Tokens of
+        [MethodBin, UriBin, VersionBin] ->
+            {Path, QueryParams} = normalize_uri(UriBin),
+            #{
+                method => method_to_atom(MethodBin),
+                uri => binary_to_list(UriBin),
+                path => Path,
+                query_params => QueryParams,
+                version => VersionBin
+            };
+        _ ->
+            throw(bad_heading)
+    end.
 
 %% @private
-parse_header([$\r, $\n | Rest], Accum) ->
-    {Accum, Rest};
-parse_header([$\n | Rest], Accum) ->
-    {Accum, Rest};
-parse_header(Packet, Accum) ->
-    {Line, Rest} = parse_line(Packet, []),
-    {Key, Value} = split_header(Line),
-    parse_header(Rest, Accum#{Key => Value}).
-
-parse_line([$\r, $\n | Rest], Accum) ->
-    {lists:reverse(Accum), Rest};
-parse_line([$\n | Rest], Accum) ->
-    {lists:reverse(Accum), Rest};
-parse_line([C | Rest], Accum) ->
-    parse_line(Rest, [C | Accum]);
-parse_line(_Packet, _Accum) ->
-    throw(bad_line).
+parse_header_lines([], Accum) ->
+    Accum;
+parse_header_lines([Line | Rest], Accum) ->
+    case strip_cr(Line) of
+        <<>> ->
+            parse_header_lines(Rest, Accum);
+        CleanLine ->
+            parse_header_lines(Rest, put_header(CleanLine, Accum))
+    end.
 
 %% @private
-split_header(Header) ->
-    case string:split(Header, ":") of
-        [Key, Value] ->
-            {list_to_binary(string:to_lower(string:trim(Key))), list_to_binary(string:trim(Value))};
+put_header(Line, Accum) ->
+    case binary:split(Line, <<":">>) of
+        [KeyBin, ValueBin] ->
+            Key = ascii_lower_bin(trim_ascii(KeyBin)),
+            Accum#{Key => trim_ascii(ValueBin)};
         _ ->
             throw(bad_header)
     end.
 
-normalize_uri(Uri) ->
-    case string:split(Uri, "?", leading) of
-        [Uri] ->
-            {tokenize_path(Uri), #{}};
-        [Path, QueryParamString] ->
-            {tokenize_path(Path), parse_query_params(QueryParamString)}
+%% @private
+normalize_uri(UriBin) ->
+    case binary:split(UriBin, <<"?">>) of
+        [PathBin] ->
+            {tokenize_path(PathBin), #{}};
+        [PathBin, QueryParamBin] ->
+            {tokenize_path(PathBin), parse_query_params(QueryParamBin)}
     end.
-
-tokenize_path(Path) ->
-    Components = string:split(Path, "/", all),
-    [list_to_binary(C) || C <- Components, C =/= []].
 
 %% @private
-parse_query_params(QueryParamString) ->
-    NVPairsStrings = string:split(QueryParamString, "&", all),
-    maps:from_list([parse_query_param(NVPairString) || NVPairString <- NVPairsStrings]).
+tokenize_path(PathBin) ->
+    [Component || Component <- binary:split(PathBin, <<"/">>, [global]), Component =/= <<>>].
 
-parse_query_param(NVPairString) ->
-    case string:split(NVPairString, "=") of
-        [Key] ->
-            {list_to_binary(Key), <<"">>};
-        [Key, Value] ->
-            %% url_decode/2 returns a charlist; convert to binary so all
-            %% query param values are binaries as declared in query_params().
-            {list_to_binary(Key), list_to_binary(url_decode(Value, []))}
+%% @private
+parse_query_params(<<>>) ->
+    #{};
+parse_query_params(QueryParamBin) ->
+    maps:from_list([
+        parse_query_param(NVPairBin)
+     || NVPairBin <- binary:split(QueryParamBin, <<"&">>, [global]), NVPairBin =/= <<>>
+    ]).
+
+%% @private
+parse_query_param(NVPairBin) ->
+    case binary:split(NVPairBin, <<"=">>) of
+        [KeyBin] ->
+            {KeyBin, <<>>};
+        [KeyBin, ValueBin] ->
+            {KeyBin, url_decode(ValueBin)}
     end.
 
-% from https://docs.microfocus.com/OMi/10.62/Content/OMi/ExtGuide/ExtApps/URL_encoding.htm
-url_decode([], Accum) ->
+%% @private
+%% General-purpose %HH decoder working directly on binaries.  Fast path: a value
+%% containing no '%' is returned unchanged (zero allocation).  Malformed escapes
+%% (e.g. "%zz" or a trailing "%") are preserved literally.
+url_decode(ValueBin) ->
+    case binary:match(ValueBin, <<"%">>) of
+        nomatch ->
+            ValueBin;
+        _ ->
+            list_to_binary(url_decode(ValueBin, []))
+    end.
+
+%% @private
+url_decode(<<>>, Accum) ->
     lists:reverse(Accum);
-url_decode([$%, $2, $0 | Rest], Accum) ->
-    url_decode(Rest, [$\s | Accum]);
-url_decode([$%, $3, $C | Rest], Accum) ->
-    url_decode(Rest, [$< | Accum]);
-url_decode([$%, $3, $E | Rest], Accum) ->
-    url_decode(Rest, [$> | Accum]);
-url_decode([$%, $2, $3 | Rest], Accum) ->
-    url_decode(Rest, [$# | Accum]);
-url_decode([$%, $2, $5 | Rest], Accum) ->
-    url_decode(Rest, [$% | Accum]);
-url_decode([$%, $2, $B | Rest], Accum) ->
-    url_decode(Rest, [$+ | Accum]);
-url_decode([$%, $7, $B | Rest], Accum) ->
-    url_decode(Rest, [${ | Accum]);
-url_decode([$%, $7, $D | Rest], Accum) ->
-    url_decode(Rest, [$} | Accum]);
-url_decode([$%, $7, $C | Rest], Accum) ->
-    url_decode(Rest, [$| | Accum]);
-url_decode([$%, $5, $C | Rest], Accum) ->
-    url_decode(Rest, [$\\ | Accum]);
-url_decode([$%, $5, $E | Rest], Accum) ->
-    url_decode(Rest, [$^ | Accum]);
-url_decode([$%, $7, $E | Rest], Accum) ->
-    url_decode(Rest, [$~ | Accum]);
-url_decode([$%, $5, $B | Rest], Accum) ->
-    url_decode(Rest, [$[ | Accum]);
-url_decode([$%, $5, $D | Rest], Accum) ->
-    url_decode(Rest, [$] | Accum]);
-url_decode([$%, $6, $0 | Rest], Accum) ->
-    url_decode(Rest, [$` | Accum]);
-url_decode([$%, $3, $B | Rest], Accum) ->
-    url_decode(Rest, [$; | Accum]);
-url_decode([$%, $2, $F | Rest], Accum) ->
-    url_decode(Rest, [$/ | Accum]);
-url_decode([$%, $3, $F | Rest], Accum) ->
-    url_decode(Rest, [$? | Accum]);
-url_decode([$%, $3, $A | Rest], Accum) ->
-    url_decode(Rest, [$: | Accum]);
-url_decode([$%, $4, $0 | Rest], Accum) ->
-    url_decode(Rest, [$@ | Accum]);
-url_decode([$%, $3, $D | Rest], Accum) ->
-    url_decode(Rest, [$= | Accum]);
-url_decode([$%, $2, $6 | Rest], Accum) ->
-    url_decode(Rest, [$& | Accum]);
-url_decode([$%, $2, $4 | Rest], Accum) ->
-    url_decode(Rest, [$$ | Accum]);
-url_decode([$%, $2, $1 | Rest], Accum) ->
-    url_decode(Rest, [$! | Accum]);
-url_decode([H | Rest], Accum) ->
-    url_decode(Rest, [H | Accum]).
+url_decode(<<$%, High, Low, Rest/binary>>, Accum) ->
+    case hex_value(High, Low) of
+        error ->
+            %% Not a valid escape: keep the '%' and re-scan the rest literally.
+            url_decode(<<High, Low, Rest/binary>>, [$% | Accum]);
+        Byte ->
+            url_decode(Rest, [Byte | Accum])
+    end;
+url_decode(<<Byte, Rest/binary>>, Accum) ->
+    url_decode(Rest, [Byte | Accum]).
+
+%% @private
+hex_value(High, Low) ->
+    case {hex_digit(High), hex_digit(Low)} of
+        {error, _} ->
+            error;
+        {_, error} ->
+            error;
+        {HighVal, LowVal} ->
+            HighVal * 16 + LowVal
+    end.
+
+%% @private
+hex_digit(Char) when Char >= $0, Char =< $9 -> Char - $0;
+hex_digit(Char) when Char >= $A, Char =< $F -> Char - $A + 10;
+hex_digit(Char) when Char >= $a, Char =< $f -> Char - $a + 10;
+hex_digit(_Char) -> error.
+
+%% @private
+%% Strip a single trailing CR (CRLF line endings) from a binary line.
+strip_cr(<<>>) ->
+    <<>>;
+strip_cr(Bin) ->
+    Size = erlang:byte_size(Bin),
+    case binary:at(Bin, Size - 1) of
+        $\r ->
+            binary:part(Bin, 0, Size - 1);
+        _ ->
+            Bin
+    end.
+
+%% @private
+%% Trim leading/trailing ASCII spaces and tabs on a binary.
+trim_ascii(Bin) ->
+    Size = erlang:byte_size(Bin),
+    Start = skip_leading_space(Bin, 0, Size),
+    End = skip_trailing_space(Bin, Size, Start),
+    binary:part(Bin, Start, End - Start).
+
+%% @private
+skip_leading_space(Bin, Pos, Size) when Pos < Size ->
+    case binary:at(Bin, Pos) of
+        Char when Char =:= $\s; Char =:= $\t ->
+            skip_leading_space(Bin, Pos + 1, Size);
+        _ ->
+            Pos
+    end;
+skip_leading_space(_Bin, Pos, _Size) ->
+    Pos.
+
+%% @private
+skip_trailing_space(_Bin, End, Start) when End =< Start ->
+    End;
+skip_trailing_space(Bin, End, Start) ->
+    case binary:at(Bin, End - 1) of
+        Char when Char =:= $\s; Char =:= $\t ->
+            skip_trailing_space(Bin, End - 1, Start);
+        _ ->
+            End
+    end.
+
+%% @private
+%% ASCII-lowercase a binary, returning it unchanged (no allocation) when it is
+%% already lowercase — the common case for header names.
+ascii_lower_bin(Bin) ->
+    case has_upper(Bin) of
+        false ->
+            Bin;
+        true ->
+            <<<<(lower_char(Char))>> || <<Char>> <= Bin>>
+    end.
+
+%% @private
+has_upper(<<Char, _Rest/binary>>) when Char >= $A, Char =< $Z ->
+    true;
+has_upper(<<_Char, Rest/binary>>) ->
+    has_upper(Rest);
+has_upper(<<>>) ->
+    false.
+
+%% @private
+lower_char(Char) when Char >= $A, Char =< $Z ->
+    Char + 32;
+lower_char(Char) ->
+    Char.
 
 get_handler(_Path, []) ->
     {error, no_handler};
@@ -599,45 +771,37 @@ path_prefix(_Prefix, _Path) ->
     false.
 
 %% @private
-str(Str, Substring) ->
-    str(Str, Substring, 1).
-
-%% @private
-str([], _, _I) ->
-    0;
-str([_H|T] = Str, Substring, I) ->
-    case starts_with(Str, Substring) of
-        true ->
-            I;
+%% Detect a WebSocket upgrade.  The `Upgrade' and `Connection' header values
+%% may be comma-separated token lists (e.g. `Connection: keep-alive, Upgrade'),
+%% so both are matched case-insensitively as substrings instead of requiring an
+%% exact value.
+get_protocol(
+    get,
+    #{
+        <<"upgrade">> := UpgradeVal,
+        <<"connection">> := ConnectionHeader,
+        <<"sec-websocket-key">> := _,
+        <<"sec-websocket-version">> := <<"13">>
+    }
+) ->
+    case ascii_lower_bin(UpgradeVal) of
+        <<"websocket">> ->
+            case binary:match(ascii_lower_bin(ConnectionHeader), <<"upgrade">>) of
+                nomatch ->
+                    http;
+                _ ->
+                    ws
+            end;
         _ ->
-            str(T, Substring, I + 1)
-    end.
-
-starts_with([], []) ->
-    true;
-starts_with([H|T1], [H|T2]) ->
-    starts_with(T1, T2);
-starts_with([_H1|_], [_H2|_]) ->
-    false.
-
-
-
-%% @private
-get_protocol(get, #{<<"upgrade">> := <<"websocket">>, <<"connection">> := Upgrade, <<"sec-websocket-key">> := _, <<"sec-websocket-version">> := <<"13">>} = _Headers) ->
-    case str(string:to_upper(binary_to_list(Upgrade)), "UPGRADE") of
-        0 ->
-            http;
-        _ ->
-            ws
+            http
     end;
 get_protocol(_, _) ->
     http.
 
-
 %% @private
 create_error(StatusCode, Error) ->
+    ?TRACE("error in httpd. StatusCode=~p  Error=~p", [StatusCode, Error]),
     ErrorString = io_lib:format("Error: ~p", [Error]),
-    io:format("error in httpd. StatusCode=~p  Error=~p~n", [StatusCode, Error]),
     create_reply(StatusCode, "text/html", ErrorString).
 
 %% @private
@@ -654,7 +818,7 @@ create_reply(StatusCode, Headers, Reply) when is_map(Headers) ->
     [
         <<"HTTP/1.1 ">>, erlang:integer_to_binary(StatusCode), <<" ">>, moniker(StatusCode),
         <<"\r\n">>,
-        io_lib:format("Server: atomvm-~s\r\n", [get_version_str(get_atomvm_version())]),
+        <<"Server: atomvm-", (get_version_bin())/binary, "\r\n">>,
         to_headers_list(HeadersWithLen),
         <<"\r\n">>,
         Reply
@@ -676,11 +840,12 @@ normalize_headers(Headers) ->
     ).
 
 normalize_header_key(Key) when is_binary(Key) ->
-    list_to_binary(string:to_lower(binary_to_list(Key)));
+    %% Fast path: already-lowercase binary keys need no copying.
+    ascii_lower_bin(Key);
 normalize_header_key(Key) when is_list(Key) ->
-    list_to_binary(string:to_lower(Key));
+    ascii_lower_bin(list_to_binary(Key));
 normalize_header_key(Key) when is_atom(Key) ->
-    list_to_binary(string:to_lower(atom_to_list(Key))).
+    ascii_lower_bin(atom_to_binary(Key, utf8)).
 
 %% @private
 ensure_content_length(Headers, ReplyLen) ->
@@ -690,21 +855,36 @@ ensure_content_length(Headers, ReplyLen) ->
     CleanHeaders#{<<"content-length">> => LenBin}.
 
 %% @private
-maybe_binary_to_string(Bin) when is_binary(Bin) ->
-    erlang:binary_to_list(Bin);
-maybe_binary_to_string(Other) ->
-    Other.
-
-%% @private
+%% Render response headers as binary iodata: [<<"key: value\r\n">>].  Values
+%% are converted in place (no charlist round-trip for binaries).
 to_headers_list(Headers) ->
-    [io_lib:format("~s: ~s\r\n", [maybe_binary_to_string(Key), maybe_binary_to_string(Value)]) || {Key, Value} <- maps:to_list(Headers)].
-
+    [
+        [KeyBin, <<": ">>, value_to_iodata(Value), <<"\r\n">>]
+     || {KeyBin, Value} <- maps:to_list(Headers)
+    ].
 
 %% @private
-get_version_str(Version) when is_binary(Version) ->
-    binary_to_list(Version);
-get_version_str(_) ->
-    "unknown".
+value_to_iodata(Value) when is_binary(Value) ->
+    Value;
+value_to_iodata(Value) when is_list(Value) ->
+    Value;
+value_to_iodata(Value) when is_atom(Value) ->
+    atom_to_binary(Value, utf8);
+value_to_iodata(Value) when is_integer(Value) ->
+    erlang:integer_to_binary(Value);
+value_to_iodata(Value) ->
+    erlang:iolist_to_binary(io_lib:format("~p", [Value])).
+
+%% @private
+get_version_bin() ->
+    case get_atomvm_version() of
+        Version when is_binary(Version) ->
+            Version;
+        Version when is_list(Version) ->
+            list_to_binary(Version);
+        _ ->
+            <<"unknown">>
+    end.
 
 get_atomvm_version() ->
     case catch erlang:system_info(atomvm_version) of
@@ -733,15 +913,18 @@ moniker(_) ->
     <<"undefined">>.
 
 %% @private
-method_to_atom("GET") ->
-    get;
-method_to_atom("PUT") ->
-    put;
-method_to_atom("POST") ->
-    post;
-method_to_atom("DELETE") ->
-    delete;
-method_to_atom(_) ->
-    undefined.
+method_to_atom(MethodBin) ->
+    case ascii_lower_bin(MethodBin) of
+        <<"get">> ->
+            get;
+        <<"put">> ->
+            put;
+        <<"post">> ->
+            post;
+        <<"delete">> ->
+            delete;
+        _ ->
+            undefined
+    end.
 
 

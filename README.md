@@ -43,7 +43,7 @@ At a high level, this server supports the following features:
 - **Per-connection process model** — each connection runs in its own worker process that owns its socket end-to-end, so a large/slow response never blocks other connections (see Architecture)
 - **ESP32-optimized networking**
   - Configurable socket options (`SO_REUSEADDR`, buffer sizes, etc.)
-  - Configurable send chunking (default 4096 bytes) with backpressure retry for lwIP's small send buffer
+  - Configurable send chunking (default 4096 bytes) and per-send timeout (default 5000 ms) with backpressure retry for lwIP's small send buffer
   - Incremental I/O list processing to minimize heap pressure
 
 The HTTPd server is designed around a callback architecture, whereby users implement behaviors to handle various requests into the HTTP server. This architecture allows developers to focus on the logic of their applications, as opposed to the nitty gritty details of the HTTP protocol, while still providing access to contextual information about the request, including:
@@ -59,6 +59,13 @@ In addition to the `httpd` server and its associated callbacks, this project als
 - HTTP File handler -- This handler supports the loading of regular files (e.g., HTML, CSS, Javascript, JPG, etc) from AVM files deployed into your application. Simply specify the application in which these files reside, and the HTTP file handler will manage all of the file loading and retrieval for you.
 - HTTP API handler -- This handler allows users to write simple REST-based API calls in response to HTTP GET, POST, PUT, and other HTTP verbs.
 - HTTP WebSocket handler -- This handler allows users to send and receive data over the WebSocket protocol.
+
+A few optional handlers also ship in `src/`:
+
+- `httpd_ota_handler` -- receives a chunked POST of an AtomVM `.avm` image, writes it to the inactive ESP32 partition (`app2.avm`) and sets it as the boot target. ESP32 only.
+- `httpd_env_api_handler` -- REST access to AtomVM application environment parameters (`GET`/`POST` under an application/parameter path). Requires the `avm_application` module from `atomvm_lib`.
+- `httpd_cmd_api_handler` -- `POST /restart` restarts the device after a short delay.
+- `httpd_stats_api_handler` -- example system/memory statistics API (used by `examples/httpd_debug`).
 
 > Note. The `httpd` server does not currently support TLS communication, so all HTTP requests and responses will be sent in the clear. Use this program at your own risk, and only on a network you can trust.
 
@@ -102,28 +109,68 @@ WiFi.
 ### Chunked sending with backpressure retry
 
 Responses are sent in `chunk_size` slices (default 4096 bytes) via
-`tcp_server:send/3`, which runs in the worker so blocking is fine. Nested
-iodata is consumed incrementally rather than flattened into one response-sized
-binary. The temporary chunk is bounded by both `chunk_size` and an internal
-iodata-entry limit, keeping peak send memory independent of total response size.
-On ESP32 the
-lwIP TCP **send buffer is small** (a few KB — roughly `4 × TCP_MSS`), so a single
-large response is many times the buffer size and must be paced:
+`tcp_server:send/3` — or `send/4` with an explicit timeout — which runs in the
+worker, so blocking is fine. Nested iodata is consumed incrementally rather than
+flattened into one response-sized binary. Each temporary chunk is bounded by
+both `chunk_size` bytes and an internal iodata-entry limit, so peak send memory
+stays independent of the total response size.
 
-- `socket:send/2` returns `ok` (fully buffered), `{ok, Rest}` (partial — buffer
-  full), or `{error, Reason}`.
-- When the send buffer fills under load, lwIP surfaces the backpressure as a
-  **transient error** (commonly `{error, closed}`) even though the connection is
-  still alive. Treating that as fatal truncates the response mid-body.
-- `do_send` therefore **retries a failed chunk** with a short backoff (bounded —
-  see `MAX_SEND_RETRIES`), only abandoning the response once retries are
-  exhausted. A genuinely-dead connection keeps failing and is given up cleanly.
-- Partial sends retry only the unsent portion of the current bounded chunk; they
-  do not concatenate it with the rest of the response.
+Every slice is sent with `socket:send/3` and a per-call **`send_timeout`**
+(default `5000` ms, or `infinity`). On AtomVM `release-0.7` this blocks until the
+data is buffered (or the timeout fires), which is far more reliable against a
+small lwIP send buffer than a tight retry loop. `socket:send/2,3` on
+`release-0.7` returns:
 
-This retry is the difference between large responses (e.g. 64 KB) truncating a
-large fraction of the time under concurrency versus completing reliably. Tune
-`chunk_size` to your platform's send-buffer headroom (see Socket Options).
+- `ok` — the data was accepted;
+- `{error, {Reason, RestData}}` — a failure carrying the bytes that were **not**
+  written;
+- `{error, Reason}` — a failure with no partial-write information.
+
+(On host OTP, `{ok, Rest}` for an explicit partial send is also possible; it is
+handled so the test suite exercises the same path.)
+
+AtomVM's socket layer already retries partial sends and `eagain` internally via
+`select`. `tcp_server` therefore classifies what is left:
+
+- **Transient** backpressure/out-of-memory errors — `eagain`, `ewouldblock`,
+  `enobufs`, `enomem` — are retried with a short backoff, bounded by
+  `MAX_SEND_RETRIES`. Only the unsent `RestData` is resent, never the whole
+  chunk (resending everything would duplicate bytes the stack already accepted).
+  A genuinely dead connection keeps failing and is abandoned after the bounded
+  budget.
+- **Terminal** errors — `closed`, `econnreset`, `epipe`, `ebadf`, `enotconn`,
+  `einval`, `eshutdown`, `timeout` — fail immediately instead of burning the
+  retry budget.
+
+`do_send_iodata/4` also coalesces *mini-chunks* before sending. An iodata
+representation with many tiny leaves (a JSON document full of one-byte
+punctuation, for example) is capped at `MAX_CHUNK_ENTRIES` (64) entries per
+chunk; up to 16 such mini-chunks are then batched into one binary of at most
+`chunk_size` bytes. Without this, headers and small JSON bodies would go out as a
+stream of 64-byte TCP segments.
+
+This handling is the difference between large responses (e.g. 64 KB) truncating
+a large fraction of the time under concurrency versus completing reliably. On
+hardware, roughly 65% of concurrent 64 KB responses were truncated before the
+retry logic and ~0% after it. Tune `chunk_size` to your platform's send-buffer
+headroom (see Socket Options).
+
+### Connection lifecycle
+
+`tcp_server` workers parse requests directly as binaries, accumulate request
+bodies incrementally (`body_chunks`, `O(N)` over received packets) and format
+responses as iodata, so no full-request or full-response copy is needed.
+
+Responses flow through `httpd`'s handler return values:
+
+- `{reply, ...}` sends the response and **keeps the connection open** when the
+  client allows it: HTTP/1.1 is persistent by default, HTTP/1.0 closes unless
+  the client sent `Connection: keep-alive`, and `Connection: close` always wins.
+- `{close, ...}` always closes the connection after the response.
+- `{noreply, ...}` keeps accumulating the current request's body.
+
+Any pipelined bytes received alongside a request body are retained on the
+connection buffer rather than being dropped.
 
 # Programming Manual
 
@@ -191,6 +238,11 @@ If successful, the HTTPd server should be listening on the specified port for cl
     start_link(Address, Port, SocketOptions, Config)
     start_link(Address, Port, SocketOptions, Options, Config)   %% Options e.g. #{request_timeout => 30000}
 
+The Elixir wrapper (`AtomvmHttpd`) mirrors these as `start_link/2..5` and `start/2..5`, taking the same `socket_options` and `options` maps:
+
+    # elixir
+    {:ok, server} = AtomvmHttpd.start_link(:any, 8080, %{send_timeout: 5000}, %{request_timeout: 30_000}, config)
+
 ### Socket Options
 
 You can customize low-level socket behavior by passing a `SocketOptions` map. Note this requires the 4-arity form, so an `Address` is given explicitly (use `any` to bind all interfaces):
@@ -200,7 +252,8 @@ You can customize low-level socket behavior by passing a `SocketOptions` map. No
     Port = 8080,
     SocketOptions = #{
         {socket, reuseaddr} => true,    %% Allow immediate port reuse (default: true)
-        {otp, recvbuf} => 8192          %% Set receive buffer size
+        {otp, recvbuf} => 8192,         %% Set receive buffer size
+        send_timeout => 5000            %% Timeout per socket:send (ms, default: 5000)
     },
     Config = ...
     {ok, Httpd} = httpd:start_link(Address, Port, SocketOptions, Config),
@@ -214,7 +267,8 @@ Supported socket options (per AtomVM's `socket` module):
 
 The following keys are handled by `tcp_server` itself and are **not** passed to `socket:setopt`:
 - `max_connections` - `non_neg_integer()` - Maximum concurrent connections (0 = unlimited, default)
-- `chunk_size` - `pos_integer()` - Maximum bytes per `socket:send/2` call (default: `4096`). Tune this to match your platform's lwIP send-buffer headroom. A 100 KB JPEG at 4096 bytes/chunk requires ~25 send calls; at 1460 bytes it required ~70. ESP32's lwIP send buffer is small (a few KB, roughly `4 × TCP_MSS`), so any response larger than that is streamed across many `socket:send` calls; `do_send` retries on send-buffer backpressure so large responses complete intact (see Architecture → "Chunked sending with backpressure retry"). Values in the 2048–4096 range are a good default; very large chunks offer no benefit since lwIP accepts at most `TCP_MSS` per call.
+- `chunk_size` - `pos_integer()` - Maximum bytes per `socket:send/3` call (default: `4096`). Tune this to match your platform's lwIP send-buffer headroom. A 100 KB JPEG at 4096 bytes/chunk requires ~25 send calls; at 1460 bytes it required ~70. ESP32's lwIP send buffer is small (a few KB, roughly `4 × TCP_MSS`), so any response larger than that is streamed across many `socket:send` calls; `tcp_server` coalesces tiny iodata chunks and retries transient send-buffer backpressure so large responses complete intact (see Architecture → "Chunked sending with backpressure retry"). Values in the 2048–4096 range are a good default; very large chunks offer no benefit since lwIP accepts at most `TCP_MSS` per call.
+- `send_timeout` - `pos_integer() | infinity` - Timeout in ms for each `socket:send/3` call (default: `5000`). `release-0.7` supports `socket:send/3`, which blocks until the data is buffered or the timeout fires; `infinity` lets a send wait indefinitely. Raise it for very slow links, lower it to fail stalled connections sooner.
 - `recv_timeout` - `pos_integer() | infinity` - Per-connection blocking-recv timeout in ms. `httpd` sets this from its `request_timeout` option so stalled/partial requests are closed.
 
 The default configuration enables `SO_REUSEADDR` which is particularly useful on ESP32 for quick restarts during development.
@@ -251,7 +305,7 @@ In the following example, two handlers are specified, the first of which is trig
 
     %% erlang
     Config = [
-        {[<<"api">>]], #{
+        {[<<"api">>], #{
             handler => httpd_api_handler,
             handler_config => #{
                 module => ?MODULE,
@@ -336,6 +390,8 @@ For example:
         }}
 
 With this example configuration, an HTTP request with the path `/index.html` will yield the `index.html` file embedded in the `httpd_example` application AVM file.
+
+The file handler replies with `{reply, ...}`, so an HTTP/1.1 client (which is persistent by default) can reuse the same connection to fetch the rest of the page's assets — CSS, Javascript and images — without a new TCP handshake. `Connection: close` and HTTP/1.0 clients are still closed after the response.
 
 > Note. The retrieval of file data from AVM files is generally quite efficient, with minimal impact on RAM resources on an ESP32 device. In general you should not be limited by file sizes, except for the spaced used by your AVM file and network overhead associated with the transfer of the file data to the HTTP client.
 
@@ -465,7 +521,7 @@ The `handler_config` map contains the following elements:
 
 For example:
 
-        {[<<"api">>]], #{
+        {[<<"api">>], #{
             handler => httpd_api_handler,
             handler_config => #{
                 module => ?MODULE
@@ -473,6 +529,8 @@ For example:
         }},
 
 With this example configuration, an HTTP request with the path `/api/system_info` will yield a JSON document with the results of the API request handler above.
+
+The built-in `httpd_api_handler` maps `{ok, Reply}` to a `{reply, ...}` response, so the connection stays open for HTTP/1.1 clients, while `{close, Reply}` always closes it after sending the body.
 
 > Note. In accordance with the design of HTTP, the HTTP API Handler and implementations of the `httpd_api_handler` behavior are inherently stateless. If you need to maintain state in your handler, then you will need to interact with a stateful service, such as a separately running Erlang process. This process may be passed through the `args` configuration parameter, or you may use the process registry to locate the stateful process by name.
 
@@ -580,7 +638,7 @@ The `handler_config` map contains the following elements:
 
 For example:
 
-        {[<<"ws">>]], #{
+        {[<<"ws">>], #{
             handler => httpd_ws_handler,
             handler_config => #{
                 module => ?MODULE
@@ -604,11 +662,11 @@ For example, the following implementation will spawn a thread that sends informa
 
     update_loop(WebSocket) ->
         timer:sleep(5000),
-        Binary = json_encoder:encode(maps:to_list(#{
+        Binary = json:encode(#{
             esp32_free_heap_size => erlang:system_info(esp32_free_heap_size),
             esp32_largest_free_block => erlang:system_info(esp32_largest_free_block),
             esp32_minimum_free_size => erlang:system_info(esp32_minimum_free_size)
-        })),
+        }),
         io:format("Sending message to client ~p ...~n", [Binary]),
         httpd_ws_handler:send(WebSocket, Binary),
         update_loop(WebSocket).

@@ -17,6 +17,9 @@
 -module(httpd_file_handler).
 
 -export([handler_module/0, init_handler/2, handle_http_req/2]).
+-ifdef(TEST).
+-export([get_content_type/1]).
+-endif.
 -behavior(httpd_handler).
 
 % -define(TRACE_ENABLED, true).
@@ -45,33 +48,41 @@ handle_http_req(#{method := get} = _HttpRequest, State) ->
         [] -> [<<"index.html">>];
         _ -> PathSuffix
     end,
-    FullPath = join("/", lists:reverse(ResolvedPath)),
+    FullPath = join_path(ResolvedPath),
     ?TRACE("App: ~p PathSuffix: ~p FullPath: ~p", [App, ResolvedPath, FullPath]),
     case atomvm:read_priv(App, FullPath) of
         undefined ->
-            io:format("httpd_file_handler: file not found - app=~p path=~p~n", [App, FullPath]),
+            ?TRACE("file not found - app=~p path=~p", [App, FullPath]),
             {error, not_found};
         Data ->
-            {close, #{"Content-Type" => get_content_type(lists:reverse(ResolvedPath))}, Data}
+            %% Reply (not close): httpd keeps HTTP/1.1 connections alive and
+            %% honours both Connection: close and HTTP/1.0 itself.
+            {reply, #{"Content-Type" => get_content_type(last_segment(ResolvedPath))}, Data, State}
     end;
 handle_http_req(_HttpRequest, _HandlerConfig) ->
     {error, internal_server_error}.
 
 %% @private
-join(Separator, Path) ->
-    join(Separator, Path, []).
+%% Join path segments in order (no reversal): [<<"js">>, <<"app.js">>] => "js/app.js".
+join_path([H | T]) ->
+    lists:flatten([binary_to_list(H) | [[$/ | binary_to_list(Segment)] || Segment <- T]]).
 
 %% @private
-join(_Separator, [], Accum) ->
-    Accum;
-join(Separator, [H|T], []) ->
-    join(Separator, T, binary_to_list(H));
-join(Separator, [H|T], Accum) ->
-    join(Separator, T, binary_to_list(H) ++ Separator ++ Accum).
+%% The filename is the final path segment.
+last_segment([Segment]) ->
+    Segment;
+last_segment([_ | T]) ->
+    last_segment(T).
 
 %% @private
-get_content_type([Filename|_]) ->
-    case get_suffix(Filename) of
+get_content_type(Filename) when is_binary(Filename) ->
+    content_type_for_suffix(get_suffix(Filename));
+get_content_type(Filename) when is_list(Filename) ->
+    content_type_for_suffix(get_suffix(list_to_binary(Filename))).
+
+%% @private
+content_type_for_suffix(Suffix) ->
+    case Suffix of
         "html" ->
             "text/html";
         "htm" ->
@@ -114,10 +125,15 @@ get_content_type([Filename|_]) ->
             "application/octet-stream"
     end.
 
+%% @private
+%% Take the final dot-separated segment so multi-dot names such as
+%% "jquery-3.1.1-min.js" resolve to "js".  `all' (rather than `trailing') is
+%% used because AtomVM 0.7's string:split/3 only implements the leading and all
+%% directions.
 get_suffix(Filename) ->
-    case string:split(binary_to_list(Filename), ".") of
-        [_Basename, Suffix] ->
-            Suffix;
-        _ ->
-            undefined
+    case string:split(Filename, <<".">>, all) of
+        [_Basename] ->
+            undefined;
+        Parts ->
+            binary_to_list(lists:last(Parts))
     end.

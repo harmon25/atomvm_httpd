@@ -12,6 +12,8 @@ Complete debug/test application for iterating on ESP32 hardware with real-world 
 - **Automated test suite** with curl-based size sweeps
 - **Endurance/soak harness** (`scripts/soak.sh` + `scripts/soak_analyze.sh`) for
   unattended multi-hour/day stability runs — see [SOAK.md](./SOAK.md)
+- **Hardware benchmark reference** for ESP32-C3 vs ESP32-S3 (throughput,
+  concurrency ceilings, memory limits) — see [BENCHMARKS.md](./BENCHMARKS.md)
 - **Serial monitoring** with persistent logs for debugging
 
 ## Prerequisites
@@ -222,6 +224,7 @@ see truncations:
 examples/httpd_debug/
 ├── mix.exs                                 # ExAtomVM project config
 ├── SOAK.md                                 # Endurance/soak testing guide
+├── BENCHMARKS.md                           # ESP32-C3 vs ESP32-S3 benchmark & stress results
 ├── lib/
 │   ├── httpd_debug.ex                      # Entrypoint: WiFi + HTTPD, self-healing retry loop
 │   └── httpd_debug/

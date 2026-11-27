@@ -22,6 +22,10 @@
 #                            detector (N * sample interval)  (default: 10)
 #       --fail-backoff <s>   Sleep this long after a failed request so a brief
 #                            network blip can't masquerade as a crash (default: 0.5)
+#       --max-size <bytes>   Largest response/upload payload to exercise; sizes
+#                            above this are filtered out     (default: 65536)
+#                            Use 16384 (or the safer 8192) on no-PSRAM boards
+#                            such as the ESP32-C3.
 #   -o, --out <dir>          Output directory for logs/CSV
 #                            (default: /tmp/atomvm_soak/<timestamp>)
 #   -h, --help               Show this help
@@ -29,6 +33,7 @@
 # Examples:
 #   ./soak.sh 192.168.1.100                      # 1 hour, 4 workers
 #   ./soak.sh 192.168.1.100 -d 28800 -c 8        # 8h overnight soak, 8 workers
+#   ./soak.sh 192.168.1.100 --max-size 16384     # ESP32-C3 (no PSRAM)
 #   nohup ./soak.sh 192.168.1.100 -d 259200 \    # 3-day unattended run
 #         -o ~/soak-3day >/dev/null 2>&1 &
 #
@@ -58,10 +63,13 @@ REQ_TIMEOUT=15
 MAX_CONSECUTIVE_FAILS=500
 MAX_UNREACHABLE=10
 FAIL_BACKOFF=0.5
+MAX_SIZE=65536
 OUTDIR=""
 
 usage() {
-    sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
+    # Print the header comment block (lines 2 .. the "bad usage" exit-code line),
+    # so the help text stays in sync when options are added.
+    sed -n '2,/^#   2  bad usage/p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -74,6 +82,7 @@ while [ $# -gt 0 ]; do
         --max-fails)          MAX_CONSECUTIVE_FAILS="$2"; shift 2 ;;
         --max-unreachable)    MAX_UNREACHABLE="$2"; shift 2 ;;
         --fail-backoff)       FAIL_BACKOFF="$2"; shift 2 ;;
+        --max-size)           MAX_SIZE="$2"; shift 2 ;;
         -o|--out)             OUTDIR="$2"; shift 2 ;;
         -h|--help)            usage 0 ;;
         -*)                   echo "Unknown option: $1" >&2; usage 2 ;;
@@ -84,6 +93,16 @@ done
 
 if [ -z "$HOST" ]; then
     echo "Error: <esp32-ip> is required" >&2
+    usage 2
+fi
+
+case "$MAX_SIZE" in
+    ''|*[!0-9]*)
+        echo "Error: --max-size must be a positive integer (bytes)" >&2
+        usage 2 ;;
+esac
+if [ "$MAX_SIZE" -lt 1 ]; then
+    echo "Error: --max-size must be a positive integer (bytes)" >&2
     usage 2
 fi
 
@@ -153,6 +172,29 @@ sample_heap() {
 GEN_SIZES=(128 512 1024 4096 8192 16384 32768 65536)
 UP_SIZES=(128 512 1024 4096 8192 16384)
 
+# Drop sizes above --max-size. No-PSRAM boards (e.g. ESP32-C3) cannot serve
+# 32/64 KB payloads reliably, so exercising them only produces failures that
+# say nothing about the library. Keep at least the smallest size so the random
+# pick never divides by zero.
+filter_max_size() {
+    local out=() s
+    for s in "$@"; do
+        [ "$s" -le "$MAX_SIZE" ] && out+=("$s")
+    done
+    echo "${out[@]}"
+}
+read -r -a GEN_SIZES <<< "$(filter_max_size "${GEN_SIZES[@]}")"
+read -r -a UP_SIZES  <<< "$(filter_max_size "${UP_SIZES[@]}")"
+if [ "${#GEN_SIZES[@]}" -eq 0 ]; then
+    echo "WARN: --max-size $MAX_SIZE is below every test size; using 128" >&2
+    GEN_SIZES=(128)
+fi
+if [ "${#UP_SIZES[@]}" -eq 0 ]; then
+    UP_SIZES=(128)
+fi
+MAX_GEN=${GEN_SIZES[${#GEN_SIZES[@]}-1]}
+MAX_UP=${UP_SIZES[${#UP_SIZES[@]}-1]}
+
 do_request() {
     local pick=$(( RANDOM % 4 ))
     case "$pick" in
@@ -221,6 +263,7 @@ echo "Sample every:  ${SAMPLE_INTERVAL}s"
 echo "Req timeout:   ${REQ_TIMEOUT}s"
 echo "Abort after:   $MAX_CONSECUTIVE_FAILS consecutive req failures, or"
 echo "               $MAX_UNREACHABLE consecutive unreachable samples"
+echo "Max payload:   ${MAX_SIZE}B (gen up to ${MAX_GEN}B, uploads up to ${MAX_UP}B)"
 echo "Output dir:    $OUTDIR"
 echo ""
 
@@ -357,6 +400,7 @@ fi
     echo "Target:            $BASE"
     echo "Ran for:           ${ELAPSED}s ($(( ELAPSED / 3600 ))h $(( (ELAPSED % 3600) / 60 ))m)"
     echo "Concurrency:       $CONCURRENCY workers"
+    echo "Max payload:       ${MAX_SIZE}B (gen<=${MAX_GEN}B up<=${MAX_UP}B)"
     echo "Total requests:    $TOTAL"
     echo "  ok:              $OKS"
     echo "  failed:          $FAILS"

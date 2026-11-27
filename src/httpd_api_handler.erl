@@ -58,16 +58,16 @@ handle_http_req(HttpRequest, State) ->
         Mod when is_atom(Mod) ->
             case Mod:handle_api_request(Method, PathSuffix, HttpRequest, Args) of
                 ok ->
-                    {close, #{"Content-Type" => "text/plain"}, "ok"};
+                    {reply, #{"Content-Type" => "text/plain"}, "ok", State};
                 {ok, Reply} when is_atom(Reply) ->
-                    {close, #{"Content-Type" => "text/plain"}, atom_to_list(Reply)};
+                    {reply, #{"Content-Type" => "text/plain"}, atom_to_list(Reply), State};
                 {ok, Reply} when is_list(Reply) ->
-                    {close, #{"Content-Type" => "text/plain"}, Reply};
+                    {reply, #{"Content-Type" => "text/plain"}, Reply, State};
                 {ok, Reply} when is_map(Reply) ->
                     ?TRACE("Encoding reply ~p", [Reply]),
                     Body = json:encode(Reply),
                     ?TRACE("JSON Body: ~p", [Body]),
-                    {close, #{"Content-Type" => "application/json"}, Body};
+                    {reply, #{"Content-Type" => "application/json"}, Body, State};
                 {close, Reply} ->
                     ?TRACE("Encoding reply ~p", [Reply]),
                     Body = json:encode(Reply),
@@ -78,14 +78,18 @@ handle_http_req(HttpRequest, State) ->
             end;
         Fun when is_function(Fun) ->
             case Fun(Method, PathSuffix, HttpRequest, Args) of
-                {ok, Reply, State} ->
+                {ok, Reply, _NewFunState} ->
                     ?TRACE("Encoding reply ~p", [Reply]),
                     Body = json:encode(Reply),
-                    {close, #{"Content-Type" => "application/json"}, Body};
+                    {reply, #{"Content-Type" => "application/json"}, Body, State};
+                {ok, Reply} ->
+                    ?TRACE("Encoding reply ~p", [Reply]),
+                    Body = json:encode(Reply),
+                    {reply, #{"Content-Type" => "application/json"}, Body, State};
                 Error ->
                     Error
             end;
-        SomethingElse ->
-            io:format("Bad Config.  Expected module or function, but got ~p~n", [SomethingElse]),
+        _SomethingElse ->
+            ?TRACE("Bad Config.  Expected module or function, but got ~p", [_SomethingElse]),
             {error, internal_server_error}
     end.

@@ -53,12 +53,37 @@ nohup ./scripts/soak.sh 192.168.1.100 -d 259200 -o ~/soak-3day \
 | `-t, --timeout`       | `15`                           | Per-request curl timeout, seconds         |
 | `--max-fails`         | `50`                           | Abort after N consecutive request failures (crash/hang detector) |
 | `--max-unreachable`   | `10`                           | Abort after N consecutive unreachable heap samples (device down) |
+| `--max-size`          | `65536`                        | Largest response/upload payload to exercise, bytes (larger sizes are filtered out) |
 | `-o, --out`           | `/tmp/atomvm_soak/<timestamp>` | Output directory                          |
 
 The load mix per request is random: ~25% ping, ~50% response generation
 (128 B – 64 KB), ~25% uploads (128 B – 16 KB). Each response is validated for a
 **complete** body (curl fails on a short read because the server always sends
 `Content-Length`), so truncated/partial responses are counted as failures.
+
+### No-PSRAM boards (ESP32-C3, ESP32-S2/S3 without PSRAM)
+
+Boards without PSRAM have only ~100–200 KB of usable internal heap, so a 64 KB
+response cannot be built in one piece. Cap the payload ladder with `--max-size`
+so the soak exercises sizes the board can actually serve:
+
+```bash
+# ESP32-C3 (no PSRAM): 128 B – 16 KB, or 8 KB for a fully clean run
+./scripts/soak.sh 192.168.1.100 -d 3600 -c 4 --max-size 16384
+./scripts/soak.sh 192.168.1.100 -d 3600 -c 4 --max-size 8192
+```
+
+The default (`65536`) is meant for PSRAM-equipped boards. Using the default on a
+no-PSRAM part yields `out_of_memory` / allocation failures at the largest sizes
+that are a hardware limit, not a library bug.
+
+> **Measured on ESP32-C3 (no PSRAM, 0.7.0-beta.1, IDF v5.5.5):** 4 workers at
+> `--max-size 8192` = 144/144 ok, 0 failures. At `--max-size 16384` a concurrent
+> `/api/generate?size=16384` logged
+> `memory_create_refc_binary: Unable to allocate 16384 bytes for refc_binary.`
+> and the VM panicked (`Store access fault`), then failed to re-associate until a
+> hard reset. On this class of board treat **8 KB as the safe ceiling** and 16 KB
+> as size-at-your-own-risk.
 
 ### Running unattended (hours/days)
 

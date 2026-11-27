@@ -34,8 +34,8 @@ handle_api_request(post, [<<"restart">>], _HttpRequest, _Args) ->
     spawn(fun() -> restart(3000) end),
     ok;
 
-handle_api_request(Method, Path, _HttpRequest, _Args) ->
-    io:format("ERROR!  Unsupported method ~p or path ~p~n", [Method, Path]),
+handle_api_request(_Method, _Path, _HttpRequest, _Args) ->
+    ?TRACE("ERROR!  Unsupported method ~p or path ~p", [_Method, _Path]),
     not_found.
 
 %%

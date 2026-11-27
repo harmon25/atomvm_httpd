@@ -43,4 +43,82 @@ defmodule HttpdUnitTest do
 
     assert :wait_for_body = :httpd.get_request_state(http_request)
   end
+
+  describe "query parameter decoding" do
+    test "decodes %20 in query parameter values" do
+      request = "GET /search?q=hello%20world HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+      assert {:ok, http_request} = :httpd.maybe_parse_http_request(request)
+      assert %{<<"q">> => <<"hello world">>} = Map.fetch!(http_request, :query_params)
+    end
+
+    test "decodes %2f and %2F (upper- and lower-case hex) in query parameters" do
+      request = "GET /files?p=a%2fb%2Fc HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+      assert {:ok, http_request} = :httpd.maybe_parse_http_request(request)
+      assert %{<<"p">> => <<"a/b/c">>} = Map.fetch!(http_request, :query_params)
+    end
+
+    test "leaves malformed %zz escapes literal" do
+      request = "GET /x?bad=%zz HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+      assert {:ok, http_request} = :httpd.maybe_parse_http_request(request)
+      assert %{<<"bad">> => <<"%zz">>} = Map.fetch!(http_request, :query_params)
+    end
+
+    test "leaves a trailing % literal" do
+      request = "GET /x?tail=% HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+      assert {:ok, http_request} = :httpd.maybe_parse_http_request(request)
+      assert %{<<"tail">> => <<"%">>} = Map.fetch!(http_request, :query_params)
+    end
+
+    test "empty query string yields no params" do
+      request = "GET /path? HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+      assert {:ok, http_request} = :httpd.maybe_parse_http_request(request)
+      assert %{} == Map.fetch!(http_request, :query_params)
+      assert [<<"path">>] = Map.fetch!(http_request, :path)
+    end
+
+    test "fast-path query params without % are parsed unchanged" do
+      request = "GET /path?a=1&b=two HTTP/1.1\r\nHost: example.com\r\n\r\n"
+
+      assert {:ok, http_request} = :httpd.maybe_parse_http_request(request)
+
+      assert %{<<"a">> => <<"1">>, <<"b">> => <<"two">>} =
+               Map.fetch!(http_request, :query_params)
+    end
+  end
+
+  describe "bad content-length" do
+    test "a non-numeric content-length is rejected" do
+      request = %{headers: %{<<"content-length">> => <<"abc">>}, body: <<>>}
+
+      assert_raise ArgumentError, fn -> :httpd.get_request_state(request) end
+    end
+
+    test "a negative content-length is rejected" do
+      request = %{headers: %{<<"content-length">> => <<"-5">>}, body: <<>>}
+
+      assert catch_throw(:httpd.get_request_state(request)) == :bad_content_length
+    end
+  end
+
+  describe "httpd_file_handler.get_content_type/1" do
+    test "resolves multi-dot filenames by the final suffix" do
+      assert content_type("jquery-3.1.1-min.js") == "text/javascript"
+      assert content_type("app.min.css") == "text/css"
+    end
+
+    test "falls back to octet-stream for a missing extension" do
+      assert content_type("noext") == "application/octet-stream"
+    end
+  end
+
+  defp content_type(filename) do
+    filename
+    |> :httpd_file_handler.get_content_type()
+    |> to_string()
+  end
 end

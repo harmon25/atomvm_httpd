@@ -53,7 +53,7 @@ handle_timeout(State)       -> {continue, State} | {close, State}               
 `handle_timeout/1` fires when a blocking recv hits the `recv_timeout` socket
 option (httpd maps `request_timeout` → `recv_timeout` to close stalled
 requests). Out-of-band sends from another process go straight to the socket
-(`tcp_server:send/3` or `socket:send`), as the WebSocket handler does. See
+(`tcp_server:send/3,4` or `socket:send`), as the WebSocket handler does. See
 `examples/tcp_echo/` for a standalone protocol example.
 
 ### Path-based routing
@@ -94,29 +94,40 @@ handle_api_request(_M, _P, _R, _A) ->
   `{otp, recvbuf}`, `{ip, add_membership}` are supported — **no `{tcp, nodelay}`**.
   `tcp_server:set_socket_options/2` uses strict `ok = socket:setopt(...)`, so an
   unsupported key **crashes the server at startup**.
-- **App-level keys are not socket options**: `max_connections`, `chunk_size`, and
-  `recv_timeout` ride in the same `SocketOptions` map but are stripped with **nested
-  `maps:remove/2`** in `tcp_server:init/1` before the setopt fold. Add any new app-level
-  key to that strip chain.
+- **App-level keys are not socket options**: `max_connections`, `chunk_size`,
+  `send_timeout`, and `recv_timeout` ride in the same `SocketOptions` map but are
+  stripped with **nested `maps:remove/2`** in `tcp_server:init/1` before the setopt
+  fold. Add any new app-level key to that strip chain.
 - **AtomVM `maps` has no `maps:without/2`** — using it crashes with `undef` at runtime
   (only surfaces on hardware, not host OTP). Strip keys with chained `maps:remove/2`.
   Likewise **`erlang:halt/1` is not implemented** (use `halt/0` or just idle).
-- `socket:send/2` returns `ok | {ok, Rest} | {error, Reason}`. Two backpressure cases must
-  both be handled in `tcp_server:do_send/3`:
-  - `{ok, Rest}` — explicit partial send; resend the remainder.
-  - `{error, Reason}` (commonly `{error, closed}`) — on ESP32 the **small lwIP send buffer**
-    (~`4 × TCP_MSS`, a few KB) surfaces backpressure as a *transient error* even though the
-    connection is alive. `do_send` **retries the chunk** with a short backoff (bounded by
-    `MAX_SEND_RETRIES`) instead of treating it as fatal. Without this, large responses
-    (e.g. 64 KB) truncate mid-body a large fraction of the time under concurrency — verified
-    on hardware (~65% → ~0% with retry). A genuinely-dead connection keeps failing and is
-    given up after the bounded budget.
+- **`socket:send/3` on AtomVM `release-0.7`** returns `ok | {error, Reason} |
+  {error, {Reason, RestData}}`. The socket layer already retries partial writes and
+  `eagain` internally via `select`, and `send/3` takes a per-call timeout
+  (`send_timeout`, default `5000` ms, or `infinity`). `tcp_server` handles the
+  remaining cases in `send_chunk/4`:
+  - `{error, {Reason, RestData}}` — resend **only `RestData`**; resending the whole
+    chunk would duplicate bytes the stack already accepted.
+  - **Transient** errors (`eagain`, `ewouldblock`, `enobufs`, `enomem`) — retry with a
+    short backoff, bounded by `MAX_SEND_RETRIES`.
+  - **Terminal** errors (`closed`, `econnreset`, `epipe`, `ebadf`, `enotconn`,
+    `einval`, `eshutdown`, `timeout`) — fail fast instead of burning the retry budget.
+  - `{ok, Rest}` — host OTP only; resend the unsent part.
+  Without the transient retry, large responses (e.g. 64 KB) truncate mid-body a large
+  fraction of the time under concurrency — verified on hardware (~65% → ~0%).
 - Responses are sent in `chunk_size` slices (default 4096; configurable per server). lwIP
   accepts at most `TCP_MSS` (~1440 B) per `socket:send`, so larger chunks just loop internally.
 - Never flatten a complete response with `iolist_to_binary/1`. `tcp_server` walks nested
-  iodata into chunks bounded by both byte size and entry count, and partial sends retry only
-  the unsent part of the current chunk. This is required to avoid response-sized allocations
-  and heap fragmentation on memory-constrained devices.
+  iodata into chunks bounded by both byte size and entry count (`MAX_CHUNK_ENTRIES = 64`),
+  and `build_send_batch/3` coalesces up to 16 mini-chunks (bounded by `chunk_size` bytes)
+  so headers + small JSON payloads are not fragmented into 64-byte TCP segments. Partial
+  sends retry only the unsent part of the current chunk. This is required to avoid
+  response-sized allocations and heap fragmentation on memory-constrained devices.
+- `httpd` parses requests directly as binaries, accumulates bodies incrementally
+  (`body_chunks`, `O(N)` over received packets) and formats responses as iodata.
+  `{reply, ...}` keeps the connection open per HTTP/1.1 keep-alive rules (HTTP/1.0
+  closes unless `Connection: keep-alive`; `Connection: close` always wins), while
+  `{close, ...}` always closes.
 - No `priv/` in this repo; `httpd_file_handler` serves from a *consumer* app's `priv`.
 
 ## Testing
@@ -148,7 +159,7 @@ not `io:format`.
 
 ## Conventions
 
-- Active development branch is `improvements` (not `main`); README dep examples pin `main`.
+- `main` is the primary development branch; README dep examples pin `main`.
 - Erlang `src/` is the source of truth; `lib/atomvm_httpd.ex` is only a convenience wrapper.
 
 ## ESP32 Debug Loop (examples/httpd_debug/)
@@ -163,7 +174,8 @@ A complete debug/test application for iterating on ESP32 hardware with real-worl
    export ATOMVM_WIFI_PSK="your-password"
    ```
 
-2. **ESP32 connection**: Connect ESP32-S3 to `/dev/ttyACM0` (or update scripts if different port).
+2. **ESP32 connection**: Connect an ESP32, ESP32-C3 or ESP32-S3 over USB serial
+   (`/dev/ttyACM0` or `/dev/ttyUSB0`; update the scripts if yours differs).
 
 3. **ESP-IDF environment**: Already available via `get_idf` alias (sources `$HOME/.espressif/v5.5.4/esp-idf/export.sh`). Flash script sources this automatically.
 

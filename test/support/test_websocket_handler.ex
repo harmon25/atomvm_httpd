@@ -31,6 +31,14 @@ defmodule TestWebSocketHandler do
 
         {:reply, "echo: #{payload}", state}
 
+      <<"close_with_reply">> ->
+        # Ask the server to send a final text frame, then close the connection.
+        {:close, "bye", state}
+
+      <<"close_silent">> ->
+        # Ask the server to close the connection without sending a frame.
+        {:close, state}
+
       _ ->
         {:reply, "echo: #{payload}", state}
     end

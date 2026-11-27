@@ -96,8 +96,8 @@ handle_api_request(delete, [Application, Param | Rest], _HttpRequest, _Args) ->
             {error, not_found}
     end;
 
-handle_api_request(Method, Path, _HttpRequest, _Args) ->
-    io:format("ERROR!  Unsupported method ~p or path ~p~n", [Method, Path]),
+handle_api_request(_Method, _Path, _HttpRequest, _Args) ->
+    ?TRACE("ERROR!  Unsupported method ~p or path ~p", [_Method, _Path]),
     {error, not_found}.
 
 find_value_in_path(Map, []) ->

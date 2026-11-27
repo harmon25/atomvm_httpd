@@ -116,7 +116,7 @@ defmodule HttpdDebug.DebugApiHandler do
   defp printable_ascii?(_bin, pos, len) when pos >= len, do: true
 
   defp printable_ascii?(bin, pos, len) do
-    <<_::binary-size(pos), byte, _::binary>> = bin
+    byte = :binary.at(bin, pos)
 
     if byte >= 32 and byte <= 126 do
       printable_ascii?(bin, pos + 1, len)

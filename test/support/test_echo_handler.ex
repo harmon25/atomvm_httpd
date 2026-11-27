@@ -15,6 +15,9 @@ defmodule AtomvmHttpd.TestEchoHandler do
     headers = Map.get(state, :reply_headers, %{"Content-Type" => "text/plain"})
     body = Map.get(state, :reply_body, "ok")
 
-    {:close, headers, body}
+    case Map.get(state, :reply_mode, :close) do
+      :reply -> {:reply, headers, body, state}
+      _ -> {:close, headers, body}
+    end
   end
 end

@@ -1,3 +1,20 @@
+defmodule TcpServerTest.ReplyProtocol do
+  @moduledoc false
+  # Replies with the iodata configured under `:reply` for every received packet.
+  # Used to exercise the bounded-chunking / coalescing send path with payloads
+  # that are made of many tiny iodata leaves.
+  @behaviour :tcp_server
+
+  @impl true
+  def init(_socket, args), do: {:ok, args}
+
+  @impl true
+  def handle_data(_data, state), do: {:send, Map.get(state, :reply, "ok"), state}
+
+  @impl true
+  def handle_close(_reason, _state), do: :ok
+end
+
 defmodule TcpServerTest do
   use ExUnit.Case, async: false
 
@@ -5,12 +22,16 @@ defmodule TcpServerTest do
 
   @recv_timeout 2_000
 
-  defp start_server(socket_opts \\ %{}, args_extra \\ %{}) do
+  defp start_server(
+         socket_opts \\ %{},
+         args_extra \\ %{},
+         protocol \\ TestEchoProtocol
+       ) do
     port = find_free_tcp_port()
     args = Map.merge(%{test_pid: self()}, args_extra)
 
     {:ok, server} =
-      :tcp_server.start_link(%{port: port}, socket_opts, TestEchoProtocol, args)
+      :tcp_server.start_link(%{port: port}, socket_opts, protocol, args)
 
     Process.sleep(20)
 
@@ -217,10 +238,175 @@ defmodule TcpServerTest do
     end
   end
 
+  describe "bounded iodata chunking" do
+    test "preserves deeply nested mixed iodata across byte boundaries" do
+      data = [<<"ab">>, [99, [<<"defgh">>, []]], [105 | <<"jkl">>]]
+
+      chunks = collect_chunks(data, 4)
+
+      assert Enum.all?(chunks, fn chunk -> :erlang.iolist_size(chunk) <= 4 end)
+      assert :erlang.iolist_to_binary(chunks) == "abcdefghijkl"
+    end
+
+    test "bounds temporary entries for many one-byte elements" do
+      data = List.duplicate(?x, 1_000)
+      [first | _] = chunks = collect_chunks(data, 4_096)
+
+      assert length(first) == 64
+      assert Enum.all?(chunks, fn chunk -> length(chunk) <= 64 end)
+      assert :erlang.iolist_to_binary(chunks) == :binary.copy("x", 1_000)
+    end
+
+    test "rejects invalid iodata and chunk sizes" do
+      assert catch_error(:tcp_server.next_chunk([256], 32)) == :badarg
+      assert catch_error(:tcp_server.next_chunk("ok", 0)) == :badarg
+    end
+  end
+
+  describe "listener lifecycle" do
+    test "stop/1 terminates the acceptor process" do
+      {server, _port} = start_server()
+
+      # #listener_state{} record layout:
+      # {listener_state, listen_socket, acceptor_pid, protocol, protocol_args,
+      #  chunk_size, send_timeout, recv_timeout, max_connections, connections}
+      acceptor = elem(:sys.get_state(server), 2)
+
+      assert is_pid(acceptor)
+      assert Process.alive?(acceptor)
+
+      ref = Process.monitor(acceptor)
+      :ok = :tcp_server.stop(server)
+
+      assert_receive {:DOWN, ^ref, :process, ^acceptor, _reason}, @recv_timeout
+      refute Process.alive?(acceptor)
+    end
+
+    test "stop/1 terminates the acceptor and closes active connections" do
+      {server, port} = start_server()
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "hi")
+        assert {:ok, "hi"} = :gen_tcp.recv(socket, 2, @recv_timeout)
+
+        acceptor = elem(:sys.get_state(server), 2)
+        ref = Process.monitor(acceptor)
+
+        :ok = :tcp_server.stop(server)
+
+        assert_receive {:DOWN, ^ref, :process, ^acceptor, _reason}, @recv_timeout
+        assert {:error, :closed} = :gen_tcp.recv(socket, 0, @recv_timeout)
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "invalid socket option fails start without crashing the caller" do
+      port = find_free_tcp_port()
+      previous = Process.flag(:trap_exit, true)
+
+      try do
+        assert {:error, {:socket_options_error, _reason}} =
+                 :tcp_server.start_link(
+                   %{port: port},
+                   %{bogus_option: true},
+                   TestEchoProtocol,
+                   %{}
+                 )
+      after
+        Process.flag(:trap_exit, previous)
+      end
+
+      # The listener is gone; the port is immediately reusable (no leaked fd).
+      {:ok, server} = :tcp_server.start_link(%{port: port}, TestEchoProtocol, %{})
+      :ok = :tcp_server.stop(server)
+    end
+  end
+
+  describe "send_timeout option" do
+    test "is accepted, stripped from socket options, and stored" do
+      {server, port} = start_server(%{send_timeout: 1_000, chunk_size: 512})
+
+      # send_timeout must never reach socket:setopt/3 (it would crash on
+      # AtomVM's allow-list), yet must be stored for the connection workers.
+      assert elem(:sys.get_state(server), 6) == 1_000
+
+      {:ok, socket} = connect(port)
+      payload = :binary.copy("s", 16_384)
+
+      try do
+        :ok = :gen_tcp.send(socket, payload)
+        assert {:ok, echoed} = recv_exact(socket, byte_size(payload))
+        assert echoed == payload
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "accepts :infinity" do
+      {_server, port} = start_server(%{send_timeout: :infinity})
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "hi")
+        assert {:ok, "hi"} = :gen_tcp.recv(socket, 2, @recv_timeout)
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+  end
+
+  describe "send coalescing" do
+    test "many tiny iodata leaves are transmitted intact" do
+      header = "HTTP/1.1 200 OK\r\nContent-Length: 302\r\n\r\n"
+      reply = [header, Enum.map(1..300, fn _n -> ?a end), "{}"]
+      total = :erlang.iolist_size(reply)
+
+      {_server, port} =
+        start_server(%{chunk_size: 4_096}, %{reply: reply}, TcpServerTest.ReplyProtocol)
+
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "go")
+        assert {:ok, received} = recv_exact(socket, total)
+        assert received == :erlang.iolist_to_binary(reply)
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "mini-chunks larger than chunk_size keep byte order and length" do
+      payload = :binary.copy("b", 5_000)
+      reply = [Enum.map(1..5_000, fn _n -> ?b end), <<>>, [[<<"b">>]]]
+
+      {_server, port} =
+        start_server(%{chunk_size: 512}, %{reply: reply}, TcpServerTest.ReplyProtocol)
+
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "go")
+        assert {:ok, received} = recv_exact(socket, 5_001)
+        assert received == payload <> "b"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+  end
+
   ## helpers
 
   defp connect(port) do
     :gen_tcp.connect(~c"localhost", port, [:binary, active: false, packet: :raw])
+  end
+
+  defp collect_chunks(iodata, chunk_size, acc \\ []) do
+    case :tcp_server.next_chunk(iodata, chunk_size) do
+      :done -> Enum.reverse(acc)
+      {chunk, rest} -> collect_chunks(rest, chunk_size, [chunk | acc])
+    end
   end
 
   defp find_free_tcp_port do

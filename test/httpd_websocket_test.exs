@@ -178,6 +178,84 @@ defmodule HttpdWebsocketTest do
     end
   end
 
+  test "handshake accepts multi-token Connection and mixed-case Upgrade", %{port: port} do
+    {:ok, socket} = connect(port)
+
+    try do
+      request = """
+      GET /ws HTTP/1.1\r
+      Host: localhost:#{port}\r
+      Upgrade: WebSocket\r
+      Connection: keep-alive, Upgrade\r
+      Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r
+      Sec-WebSocket-Version: 13\r
+      \r
+      """
+
+      :ok = :gen_tcp.send(socket, request)
+
+      response = read_http_response(socket)
+      assert response =~ "HTTP/1.1 101 Switching Protocols"
+      assert response =~ "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+
+      assert_receive {:ws_init, _websocket, _path}, @receive_timeout
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  test "processes two masked frames coalesced into a single TCP packet", %{port: port} do
+    {:ok, socket} = ws_connect(port)
+
+    try do
+      frame1 = create_ws_frame("one", :text, true)
+      frame2 = create_ws_frame("two", :text, true)
+
+      # Both frames in a single send: the server must split and dispatch each.
+      :ok = :gen_tcp.send(socket, frame1 <> frame2)
+
+      assert_receive {:ws_message, <<"one">>}, @receive_timeout
+      assert_receive {:ws_message, <<"two">>}, @receive_timeout
+
+      assert {:ok, payloads} = recv_ws_frames(socket, 2)
+      assert payloads == ["echo: one", "echo: two"]
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  test "handler {close, reply, state} sends a final frame then closes", %{port: port} do
+    {:ok, socket} = ws_connect(port)
+
+    try do
+      :ok = :gen_tcp.send(socket, create_ws_frame("close_with_reply", :text, true))
+
+      assert_receive {:ws_message, <<"close_with_reply">>}, @receive_timeout
+
+      assert {:ok, ["bye"]} = recv_ws_frames(socket, 1)
+
+      # The server closes the connection after the final frame.
+      assert {:error, :closed} = :gen_tcp.recv(socket, 0, @receive_timeout)
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  test "handler {close, state} closes the connection cleanly", %{port: port} do
+    {:ok, socket} = ws_connect(port)
+
+    try do
+      :ok = :gen_tcp.send(socket, create_ws_frame("close_silent", :text, true))
+
+      assert_receive {:ws_message, <<"close_silent">>}, @receive_timeout
+
+      # No reply frame — the connection is simply closed.
+      assert {:error, :closed} = :gen_tcp.recv(socket, 0, @receive_timeout)
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
   # Helper functions
 
   defp ws_connect(port) do
@@ -314,7 +392,7 @@ defmodule HttpdWebsocketTest do
         {:ok, payload}
 
       len ->
-        <<payload::binary-size(len), _::binary>> = rest
+        <<payload::binary-size(^len), _::binary>> = rest
         {:ok, payload}
     end
   end
@@ -371,6 +449,59 @@ defmodule HttpdWebsocketTest do
       len ->
         total_needed = 2 + mask_size + len
         if byte_size(data) >= total_needed, do: {:complete, total_needed}, else: :incomplete
+    end
+  end
+
+  # Accumulate unmasked server->client frames until `count` complete payloads
+  # have been read, keeping any partially-received frame for the next recv.
+  defp recv_ws_frames(socket, count, acc \\ <<>>, collected \\ []) do
+    {payloads, rest} = take_ws_frames(acc)
+    collected = collected ++ payloads
+
+    if length(collected) >= count do
+      {:ok, Enum.take(collected, count)}
+    else
+      case :gen_tcp.recv(socket, 0, @receive_timeout) do
+        {:ok, chunk} -> recv_ws_frames(socket, count, rest <> chunk, collected)
+        error -> error
+      end
+    end
+  end
+
+  # Parse as many complete unmasked server frames as possible, returning the
+  # payloads found plus any trailing incomplete bytes.
+  defp take_ws_frames(<<>>), do: {[], <<>>}
+
+  defp take_ws_frames(<<_fin_opcode, mask_len, rest::binary>> = buffer) do
+    case band(mask_len, 0x7F) do
+      126 ->
+        if byte_size(rest) >= 2 do
+          <<len::16, tail::binary>> = rest
+          take_ws_payload(tail, buffer, len)
+        else
+          {[], buffer}
+        end
+
+      127 ->
+        if byte_size(rest) >= 8 do
+          <<len::64, tail::binary>> = rest
+          take_ws_payload(tail, buffer, len)
+        else
+          {[], buffer}
+        end
+
+      len ->
+        take_ws_payload(rest, buffer, len)
+    end
+  end
+
+  defp take_ws_payload(data, buffer, len) do
+    if byte_size(data) >= len do
+      <<payload::binary-size(^len), remaining::binary>> = data
+      {payloads, rest} = take_ws_frames(remaining)
+      {[payload | payloads], rest}
+    else
+      {[], buffer}
     end
   end
 end

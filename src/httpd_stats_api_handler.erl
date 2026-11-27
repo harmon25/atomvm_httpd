@@ -36,8 +36,8 @@ handle_api_request(get, [<<"memory">>], _HttpRequest, _Args) ->
     ?TRACE("GET memory request", []),
     {ok, get_memory()};
 
-handle_api_request(Method, Path, _HttpRequest, _Args) ->
-    io:format("ERROR!  Unsupported method ~p or path ~p~n", [Method, Path]),
+handle_api_request(_Method, _Path, _HttpRequest, _Args) ->
+    ?TRACE("ERROR!  Unsupported method ~p or path ~p", [_Method, _Path]),
     not_found.
 
 %%

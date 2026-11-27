@@ -1,3 +1,13 @@
+defmodule ApiKeepAliveHandler do
+  @moduledoc false
+  @behaviour :httpd_api_handler
+
+  @impl true
+  def handle_api_request(:get, [<<"open">>], _request, _args), do: {:ok, %{status: "open"}}
+  def handle_api_request(:get, [<<"shut">>], _request, _args), do: {:close, %{status: "shut"}}
+  def handle_api_request(_method, _path, _request, _args), do: {:error, :not_found}
+end
+
 defmodule HttpdIntegrationTest do
   use ExUnit.Case
 
@@ -528,6 +538,274 @@ defmodule HttpdIntegrationTest do
     end
   end
 
+  describe "keep-alive connections" do
+    @tag handler_config: %{reply_mode: :reply}
+    test "serves multiple sequential GET/POST requests on one HTTP/1.1 connection", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        assert_receive {:http_request, get_request}, @receive_timeout
+        assert get_request.method == :get
+
+        assert {:ok, response1} = recv_one_response(socket)
+        assert response1 =~ "HTTP/1.1 200 OK"
+
+        body = "hello"
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "POST /two HTTP/1.1\r\nHost: example.com\r\nContent-Length: #{byte_size(body)}\r\n\r\n#{body}"
+          )
+
+        assert_receive {:http_request, post_request}, @receive_timeout
+        assert post_request.method == :post
+        assert post_request.body == body
+
+        assert {:ok, response2} = recv_one_response(socket)
+        assert response2 =~ "HTTP/1.1 200 OK"
+
+        :ok = :gen_tcp.send(socket, "GET /three HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        assert_receive {:http_request, get_request3}, @receive_timeout
+        assert get_request3.method == :get
+
+        assert {:ok, response3} = recv_one_response(socket)
+        assert response3 =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    @tag handler_config: %{reply_mode: :reply}
+    test "Connection: close closes even when the handler returns reply", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+          )
+
+        # recv_all only returns once the server closes the connection.
+        assert {:ok, response} = recv_all(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    @tag handler_config: %{reply_mode: :reply}
+    test "HTTP/1.0 closes by default even when the handler returns reply", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+
+        assert {:ok, response} = recv_all(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    @tag handler_config: %{reply_mode: :reply}
+    test "HTTP/1.0 stays open when Connection: keep-alive is sent", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "GET /first HTTP/1.0\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n"
+          )
+
+        assert {:ok, response1} = recv_one_response(socket)
+        assert response1 =~ "HTTP/1.1 200 OK"
+
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "GET /second HTTP/1.0\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n"
+          )
+
+        assert {:ok, response2} = recv_one_response(socket)
+        assert response2 =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    @tag handler_config: %{reply_mode: :reply}
+    test "preserves pipelined bytes after a Content-Length body", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        # The POST body is exactly 5 bytes ("hello"); the trailing bytes start
+        # the next request and must be buffered, not appended to the body.
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "POST /first HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhelloGET /n"
+          )
+
+        assert_receive {:http_request, first}, @receive_timeout
+        assert first.method == :post
+        assert first.body == "hello"
+
+        assert {:ok, response1} = recv_one_response(socket)
+        assert response1 =~ "HTTP/1.1 200 OK"
+
+        # Complete the partially-buffered second request.
+        :ok = :gen_tcp.send(socket, "ext HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+        assert_receive {:http_request, second}, @receive_timeout
+        assert second.method == :get
+        assert second.path == [<<"next">>]
+
+        assert {:ok, response2} = recv_one_response(socket)
+        assert response2 =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+  end
+
+  test "reassembles a 20KB body delivered in many small chunks", %{port: port} do
+    body = :binary.copy("z", 20_000)
+    {:ok, socket} = connect(port)
+
+    try do
+      :ok =
+        :gen_tcp.send(
+          socket,
+          "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: #{byte_size(body)}\r\n\r\n"
+        )
+
+      send_chunks(socket, chunk_binary(body, 512))
+
+      assert_receive {:http_request, request}, @receive_timeout
+      assert request.method == :post
+      assert request.body == body
+
+      assert {:ok, response} = recv_all(socket)
+      assert response =~ "HTTP/1.1 200 OK"
+    after
+      :gen_tcp.close(socket)
+    end
+  end
+
+  describe "httpd_api_handler keep-alive semantics" do
+    setup do
+      port = find_free_tcp_port()
+
+      config = [
+        {[<<"api">>],
+         %{handler: :httpd_api_handler, handler_config: %{module: ApiKeepAliveHandler, args: nil}}}
+      ]
+
+      {:ok, server} = :httpd.start_link(port, config)
+      Process.sleep(20)
+
+      on_exit(fn -> safe_stop(server) end)
+
+      {:ok, port: port}
+    end
+
+    test "{ok, Map} keeps an HTTP/1.1 connection open", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "GET /api/open HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        assert {:ok, response1} = recv_one_response(socket)
+        assert response1 =~ "HTTP/1.1 200 OK"
+        assert response1 =~ "application/json"
+
+        :ok = :gen_tcp.send(socket, "GET /api/open HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        assert {:ok, response2} = recv_one_response(socket)
+        assert response2 =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "{close, Map} closes the connection", %{port: port} do
+      {:ok, socket} = connect(port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "GET /api/shut HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+        # recv_all returns once the server closes the connection.
+        assert {:ok, response} = recv_all(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+        assert response =~ "application/json"
+
+        assert {:error, reason} = :gen_tcp.recv(socket, 0, @receive_timeout)
+        assert reason in [:closed, :enotconn]
+      after
+        :gen_tcp.close(socket)
+      end
+    end
+
+    test "function-based handler with {ok, Map, FunState} replies" do
+      api_fun = fn :get, _path, _request, _args -> {:ok, %{fun: true}, :fun_state} end
+      fn_port = find_free_tcp_port()
+
+      config = [
+        {[<<"fnapi">>],
+         %{handler: :httpd_api_handler, handler_config: %{module: api_fun, args: nil}}}
+      ]
+
+      {:ok, server} = :httpd.start_link(fn_port, config)
+      Process.sleep(20)
+
+      {:ok, socket} = connect(fn_port)
+
+      try do
+        :ok = :gen_tcp.send(socket, "GET /fnapi/x HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        assert {:ok, response} = recv_one_response(socket)
+        assert response =~ "HTTP/1.1 200 OK"
+        assert response =~ "application/json"
+
+        # The connection stays open, so a second request still succeeds.
+        :ok = :gen_tcp.send(socket, "GET /fnapi/y HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        assert {:ok, response2} = recv_one_response(socket)
+        assert response2 =~ "HTTP/1.1 200 OK"
+      after
+        :gen_tcp.close(socket)
+        safe_stop(server)
+      end
+    end
+  end
+
+  test "AtomvmHttpd.start_link/5 works with socket and server options" do
+    port = find_free_tcp_port()
+    config = [{[], %{handler: TestEchoHandler, handler_config: %{test_pid: self()}}}]
+
+    {:ok, server} =
+      AtomvmHttpd.start_link(
+        :any,
+        port,
+        %{chunk_size: 1024, send_timeout: 5000},
+        %{request_timeout: 5000},
+        config
+      )
+
+    Process.sleep(20)
+    {:ok, socket} = connect(port)
+
+    try do
+      :ok = :gen_tcp.send(socket, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+      assert {:ok, response} = recv_all(socket)
+      assert response =~ "HTTP/1.1 200 OK"
+    after
+      :gen_tcp.close(socket)
+      safe_stop(server)
+    end
+  end
+
   defp connect(port) do
     :gen_tcp.connect(~c"localhost", port, [:binary, active: false, packet: :raw])
   end
@@ -559,6 +837,56 @@ defmodule HttpdIntegrationTest do
       {:ok, chunk} -> recv_all(socket, <<acc::binary, chunk::binary>>)
       {:error, :closed} -> {:ok, acc}
       error -> error
+    end
+  end
+
+  # Receive exactly one keep-alive HTTP response (headers + Content-Length body),
+  # leaving the connection open for subsequent requests.
+  defp recv_one_response(socket, acc \\ <<>>) do
+    case :binary.split(acc, "\r\n\r\n") do
+      [_headers] ->
+        case :gen_tcp.recv(socket, 0, @receive_timeout) do
+          {:ok, chunk} -> recv_one_response(socket, acc <> chunk)
+          error -> error
+        end
+
+      [headers, rest] ->
+        body_len = response_content_length(headers)
+
+        if byte_size(rest) >= body_len do
+          {:ok, headers <> "\r\n\r\n" <> binary_part(rest, 0, body_len)}
+        else
+          case :gen_tcp.recv(socket, 0, @receive_timeout) do
+            {:ok, chunk} -> recv_one_response(socket, acc <> chunk)
+            error -> error
+          end
+        end
+    end
+  end
+
+  defp response_content_length(headers) do
+    case Regex.run(~r/content-length:\s*(\d+)/i, headers) do
+      [_, len] -> String.to_integer(len)
+      _ -> 0
+    end
+  end
+
+  defp chunk_binary(binary, chunk_size) do
+    for <<chunk::binary-size(^chunk_size) <- binary>> do
+      chunk
+    end
+    |> append_remainder(binary, chunk_size)
+  end
+
+  defp append_remainder(chunks, binary, chunk_size) do
+    remainder = rem(byte_size(binary), chunk_size)
+
+    case remainder do
+      0 ->
+        chunks
+
+      _ ->
+        chunks ++ [binary_part(binary, byte_size(binary) - remainder, remainder)]
     end
   end
 end

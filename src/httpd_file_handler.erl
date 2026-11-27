@@ -39,7 +39,7 @@ init_handler(PathSuffix, HandlerConfig) ->
     {ok, #state{path_suffix = PathSuffix, handler_config = HandlerConfig}}.
 
 %% @hidden
-handle_http_req(#{method := get} = _HttpRequest, State) ->
+handle_http_req(#{method := get} = HttpRequest, State) ->
     HandlerConfig = State#state.handler_config,
     App = maps:get(app, HandlerConfig),
     PathSuffix = State#state.path_suffix,
@@ -49,18 +49,56 @@ handle_http_req(#{method := get} = _HttpRequest, State) ->
         _ -> PathSuffix
     end,
     FullPath = join_path(ResolvedPath),
-    ?TRACE("App: ~p PathSuffix: ~p FullPath: ~p", [App, ResolvedPath, FullPath]),
-    case atomvm:read_priv(App, FullPath) of
-        undefined ->
-            ?TRACE("file not found - app=~p path=~p", [App, FullPath]),
-            {error, not_found};
-        Data ->
-            %% Reply (not close): httpd keeps HTTP/1.1 connections alive and
-            %% honours both Connection: close and HTTP/1.0 itself.
-            {reply, #{"Content-Type" => get_content_type(last_segment(ResolvedPath))}, Data, State}
+    ContentType = get_content_type(last_segment(ResolvedPath)),
+    AcceptsGzip = accepts_gzip(get_accept_encoding(HttpRequest)),
+    ?TRACE("App: ~p PathSuffix: ~p FullPath: ~p Gzip: ~p", [App, ResolvedPath, FullPath, AcceptsGzip]),
+    try
+        serve_file(App, FullPath, ContentType, AcceptsGzip, State)
+    catch
+        _:_Reason ->
+            ?TRACE("httpd_file_handler: error reading file ~p: ~p", [FullPath, _Reason]),
+            {error, internal_server_error}
     end;
 handle_http_req(_HttpRequest, _HandlerConfig) ->
     {error, internal_server_error}.
+
+%% @private
+%% Serve a pre-compressed "<path>.gz" asset when the client advertises gzip
+%% support, otherwise fall back to the original file.  Replies (not closes) so
+%% httpd keeps HTTP/1.1 connections alive and honours Connection: close and
+%% HTTP/1.0 itself.
+serve_file(App, FullPath, ContentType, true = _AcceptsGzip, State) ->
+    case atomvm:read_priv(App, FullPath ++ ".gz") of
+        Data when is_binary(Data) ->
+            {reply, #{"Content-Type" => ContentType, "Content-Encoding" => "gzip"}, Data, State};
+        undefined ->
+            %% No pre-compressed variant — serve the original.
+            serve_file(App, FullPath, ContentType, false, State)
+    end;
+serve_file(App, FullPath, ContentType, false = _AcceptsGzip, State) ->
+    case atomvm:read_priv(App, FullPath) of
+        Data when is_binary(Data) ->
+            {reply, #{"Content-Type" => ContentType}, Data, State};
+        undefined ->
+            ?TRACE("file not found - app=~p path=~p", [App, FullPath]),
+            {error, not_found}
+    end.
+
+%% @private
+%% httpd lowercases incoming header names; support both forms defensively.
+get_accept_encoding(#{headers := Headers}) when is_map(Headers) ->
+    case maps:get(<<"accept-encoding">>, Headers, undefined) of
+        undefined -> maps:get(<<"Accept-Encoding">>, Headers, <<>>);
+        Value -> Value
+    end;
+get_accept_encoding(_) ->
+    <<>>.
+
+%% @private
+accepts_gzip(Value) when is_binary(Value) ->
+    binary:match(ascii_lower_bin(Value), <<"gzip">>) =/= nomatch;
+accepts_gzip(_) ->
+    false.
 
 %% @private
 %% Join path segments in order (no reversal): [<<"js">>, <<"app.js">>] => "js/app.js".
@@ -124,6 +162,31 @@ content_type_for_suffix(Suffix) ->
         _ ->
             "application/octet-stream"
     end.
+
+%% @private
+%% ASCII-lowercase a binary (AtomVM has no string:lowercase/1).  Returns the
+%% binary unchanged when it is already lowercase.
+ascii_lower_bin(Bin) ->
+    case has_upper(Bin) of
+        false ->
+            Bin;
+        true ->
+            <<<<(lower_char(Char))>> || <<Char>> <= Bin>>
+    end.
+
+%% @private
+has_upper(<<Char, _Rest/binary>>) when Char >= $A, Char =< $Z ->
+    true;
+has_upper(<<_Char, Rest/binary>>) ->
+    has_upper(Rest);
+has_upper(<<>>) ->
+    false.
+
+%% @private
+lower_char(Char) when Char >= $A, Char =< $Z ->
+    Char + 32;
+lower_char(Char) ->
+    Char.
 
 %% @private
 %% Take the final dot-separated segment so multi-dot names such as
